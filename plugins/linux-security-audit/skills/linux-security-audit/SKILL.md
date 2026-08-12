@@ -277,3 +277,12 @@ Known gaps in this skill, worth naming in a report's *Not assessed* section: ker
 build options, mail/DNS/print/proxy server hardening beyond exposure, BSD and Solaris,
 user-context credential theft (agent sockets, tmux, Kerberos), and anything requiring an external
 vantage point (`testssl.sh`, `ssh-audit`, external port scan).
+
+## Where this skill lives
+
+Home, updates and issues: <https://github.com/jonaslejon/linux-security-audit-plugin>
+
+Installed with `/plugin marketplace add jonaslejon/linux-security-audit-plugin` then
+`/plugin install linux-security-audit`. If a check misfires — especially a `FAIL` that should
+have been `NA` — that is worth reporting there, because a manufactured finding is the failure
+mode this skill cares most about avoiding.
