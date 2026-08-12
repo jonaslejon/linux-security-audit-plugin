@@ -119,8 +119,8 @@ offline_na() {
 dir_readable() { for _d in "$@"; do [ -d "$_d" ] && [ -r "$_d" ] && return 0; done; return 1; }
 # statmode <file> — mode only, empty if stat is unavailable or fails. Callers MUST treat
 # empty as "unknown" and emit NA, never as a permissive default.
-statmode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
-statown()  { stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null; }
+statmode() { stat -L -c '%a' "$1" 2>/dev/null || stat -L -f '%Lp' "$1" 2>/dev/null; }
+statown()  { stat -L -c '%u:%g' "$1" 2>/dev/null || stat -L -f '%u:%g' "$1" 2>/dev/null; }
 # need <id> <what-is-missing> — emit NA and return 1 so the caller can skip its check
 need() { chk "$1" NA "prerequisite unavailable: $2" "not determinable in this collection mode — this is NOT a pass and NOT a failure"; return 1; }
 # Section defaults: the dominant acquisition method for that section. Individual checks that
@@ -155,13 +155,26 @@ run()  { tmo 25 "$@"; }
 path_risk() {
   _p="$1"; _w=""; _g=""; _o=""; _depth=0
   while [ -n "$_p" ] && [ "$_p" != "/" ] && [ "$_p" != "." ]; do
-    if [ -e "$_p" ]; then
-      _s="$(stat -c '%a %U %G' "$_p" 2>/dev/null)"
+    if [ -e "$_p" ] || [ -L "$_p" ]; then
+      # A SYMLINK'S OWN MODE IS ALWAYS 0777 and carries no information — /bin -> usr/bin is
+      # lrwxrwxrwx on every Linux host. Evaluating it directly reports "/bin is world-writable",
+      # which is alarming and wrong. Follow the link and judge the target; what actually governs
+      # replaceability is the target's mode and the writability of the parent directories, which
+      # this walk already covers.
+      if [ -L "$_p" ]; then
+        _tgt="$(readlink -f "$_p" 2>/dev/null)"
+        if [ -n "$_tgt" ] && [ -e "$_tgt" ]; then
+          _s="$(stat -L -c '%a %U %G' "$_p" 2>/dev/null)"
+        else
+          _s=""   # dangling symlink: nothing to evaluate
+        fi
+      else
+        _s="$(stat -c '%a %U %G' "$_p" 2>/dev/null)"
+      fi
       if [ -n "$_s" ]; then
         _m="${_s%% *}"; _own="$(printf '%s' "$_s" | awk '{print $2}')"; _grp="$(printf '%s' "$_s" | awk '{print $3}')"
         # Sticky world-writable ANCESTOR directories (/tmp, /var/tmp, /dev/shm = 1777) are not a
-        # replace risk: the sticky bit stops non-owners deleting or renaming entries. Without this
-        # every path under /tmp reports as writable, which is noise on every host.
+        # replace risk: the sticky bit stops non-owners deleting or renaming entries.
         _sticky=0
         if [ "${#_m}" = "4" ]; then case "$_m" in 1*|3*|5*|7*) _sticky=1 ;; esac; fi
         _skipw=0
@@ -176,10 +189,9 @@ path_risk() {
     _depth=$((_depth+1))
     _p="$(dirname "$_p")"
   done
-  if   [ -n "$_w" ]; then printf '%s' "$_w"; return 0
-  elif [ -n "$_g" ]; then printf '%s' "$_g"; return 0
-  elif [ -n "$_o" ]; then printf '%s' "$_o"; return 0
-  fi
+  [ -n "$_w" ] && { printf '%s' "$_w"; return 0; }
+  [ -n "$_g" ] && { printf '%s' "$_g"; return 0; }
+  [ -n "$_o" ] && { printf '%s' "$_o"; return 0; }
   return 1
 }
 trim() { printf '%s' "$1" | tr -s ' \t' ' ' | sed 's/^ *//;s/ *$//'; }
@@ -1533,7 +1545,7 @@ if [ -n "$WS" ]; then
   for cd in /etc/nginx /etc/apache2 /etc/httpd /etc/php; do
     [ -d "$cd" ] || continue
     stat -c '  %a %U:%G %n' "$cd" 2>/dev/null
-    BADCFG="$(find "$cd" -maxdepth 3 \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | head -15)"
+    BADCFG="$(find "$cd" -maxdepth 3 ! -type l \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | head -15)"
     if [ -n "$BADCFG" ]; then
       printf '%s\n' "$BADCFG" | tr '\n' '\0' | xargs -0 ls -ld 2>/dev/null
       chk "web.config_writable.$(basename "$cd")" FAIL "$(printf '%s' "$BADCFG" | tr '\n' ' ' | cut -c1-140)" "group- or world-writable web server config — whoever can write it controls what the server executes on the next reload"
@@ -2075,8 +2087,18 @@ fi
 tls_hs() { echo | tmo 6 openssl s_client -connect "127.0.0.1:$1" ${2:+$2} -servername localhost </dev/null 2>&1; }
 # true if the given s_client output shows a completed handshake with a real cipher
 # (POSIX character classes throughout — \s is not portable across awk/grep implementations)
-tls_ok() { printf '%s' "$1" | grep -qE '^[[:space:]]*Cipher[[:space:]]*:[[:space:]]*[A-Za-z0-9]' \
-           && ! printf '%s' "$1" | grep -qE 'Cipher[[:space:]]*:[[:space:]]*\(NONE\)'; }
+# A real handshake reports a NAMED cipher. OpenSSL prints "Cipher : 0000" (and TLSv1.2 as the
+# protocol) when nothing was negotiated — which is what you get probing SSH on 22 or plaintext
+# HTTP on 80. Treating that as a TLS endpoint made every non-TLS port produce a full set of
+# bogus weak-cipher FAILs, so require a cipher name that is not 0000/(NONE)/empty.
+tls_ok() {
+  _c="$(printf '%s' "$1" | awk -F': *' '/^[[:space:]]*Cipher[[:space:]]*:/{print $2; exit}' | tr -d ' \r')"
+  case "$_c" in
+    ""|0000|"(NONE)"|NONE) return 1 ;;
+    *[A-Za-z]*) return 0 ;;    # a named suite, e.g. ECDHE-RSA-AES256-GCM-SHA384
+    *) return 1 ;;
+  esac
+}
 tls_field() { printf '%s' "$1" | awk -F': *' -v k="$2" '$0 ~ "^[[:space:]]*"k"[[:space:]]*:" {print $2; exit}'; }
 # Did the server send a CertificateRequest? NOTE: "No client certificate CA names sent" is printed
 # by some TLS libraries even when no CertificateRequest was made — it is NOT a valid indicator.
@@ -2134,10 +2156,29 @@ for p in $TLS_PORTS; do
     "nopfs|kRSA:@SECLEVEL=0|static RSA key exchange — NO forward secrecy; one stolen private key decrypts all past recorded traffic" \
   ; do
     lbl="${spec%%|*}"; rest="${spec#*|}"; cs="${rest%%|*}"; note="${rest#*|}"
+    # A modern openssl will not OFFER RC4/3DES/EXPORT at all, so it cannot test for them. If the
+    # local build has no cipher matching the spec, the probe proves nothing — report NA rather
+    # than a verdict. Without this the client's inability to ask reads as the server's answer.
+    if [ -z "$(openssl ciphers "$cs" 2>/dev/null)" ]; then
+      chk "tls.$p.weak.$lbl" NA "local openssl offers no cipher matching '$cs'" "this build cannot test that family — not evidence the server rejects it. Use a legacy openssl build, or testssl.sh, which carries its own"
+      continue
+    fi
     O="$(echo | tmo 6 openssl s_client -connect "127.0.0.1:$p" -cipher "$cs" </dev/null 2>&1)"
-    case "$O" in *"no cipher match"*|*"unknown option"*) chk "tls.$p.weak.$lbl" PASS "not offered by local openssl" ""; continue ;; esac
-    tls_ok "$O" && chk "tls.$p.weak.$lbl" FAIL "ACCEPTED" "$note" \
-                || chk "tls.$p.weak.$lbl" PASS "rejected" ""
+    case "$O" in *"no cipher match"*|*"unknown option"*|*"no ciphers available"*)
+      chk "tls.$p.weak.$lbl" NA "local openssl refused the cipher spec" "cannot test this family from here"; continue ;; esac
+    if tls_ok "$O"; then
+      # A handshake completed — but confirm the NEGOTIATED cipher is actually in the family we
+      # asked for. If -cipher failed to constrain and the server picked something modern, the
+      # server did not accept the weak family and reporting it as ACCEPTED would be wrong.
+      NEG="$(tls_field "$O" Cipher)"
+      if openssl ciphers "$cs" 2>/dev/null | tr ':' '\n' | grep -qxF "$NEG"; then
+        chk "tls.$p.weak.$lbl" FAIL "ACCEPTED ($NEG)" "$note"
+      else
+        chk "tls.$p.weak.$lbl" PASS "rejected (negotiated $NEG, outside the tested family)" ""
+      fi
+    else
+      chk "tls.$p.weak.$lbl" PASS "rejected" ""
+    fi
   done
 
   # ---- certificate quality ----
@@ -3599,7 +3640,7 @@ IFS="$OLDIFS"
 # ---- writable systemd units and the binaries they run ----
 raw "writable systemd unit files (a writable unit is root at next start/reboot)"
 WUNITS="$(find /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system /run/systemd/system \
-  -maxdepth 2 -type f \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | head -20)"
+  -maxdepth 2 -type f ! -type l \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | head -20)"
 if [ -n "$WUNITS" ]; then
   printf '%s\n' "$WUNITS" | tr '\n' '\0' | xargs -0 ls -l 2>/dev/null
   chk privesc.writable_units FAIL "$(printf '%s' "$WUNITS" | tr '\n' ' ' | cut -c1-160)" "group- or world-writable unit file — whoever can write it controls a command that systemd runs as root"
