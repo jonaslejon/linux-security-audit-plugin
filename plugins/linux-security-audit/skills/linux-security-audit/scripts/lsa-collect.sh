@@ -49,6 +49,12 @@
 
 LC_ALL=C
 export LC_ALL
+# A non-login shell — which is exactly what `ssh host 'sudo bash -s' < script` gives you —
+# typically has no /sbin or /usr/sbin on PATH. Without them have() returns false for iptables,
+# nft, ss, sshd, auditctl, lsmod, sysctl and findmnt, and every check that depends on one
+# silently reports "not present" on a host where it is installed and running.
+case ":$PATH:" in *:/usr/sbin:*) ;; *) PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH" ;; esac
+export PATH
 QUICK=0
 PROBE=1
 APTUPDATE=0
@@ -207,6 +213,7 @@ printf '===== LINUX SECURITY AUDIT COLLECTOR =====\n'
 printf 'collected_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
 printf 'hostname=%s\n' "$(hostname 2>/dev/null)"
 printf 'running_as_root=%s\n' "$AM_ROOT"
+printf 'PATH=%s\n' "$PATH"
 printf 'quick_mode=%s\n' "$QUICK"
 [ "$OFFLINE" = "1" ] && printf 'MODE: OFFLINE (--root %s). Config is read from the mounted tree; every check needing a running\n      kernel or live service reports NA rather than describing the auditing host.\n' "$LSA_ROOT"
 [ "$AM_ROOT" = "0" ] && printf 'NOTE: not root — several checks will report NA (insufficient privilege), not PASS.\n'
@@ -225,6 +232,17 @@ uptime 2>/dev/null
 
 KREL="$(uname -r)"
 chk kernel.release INFO "$KREL" ""
+# If a collection tool is missing, every check that needs it degrades. Say so once, loudly,
+# rather than letting each dependent check report a misleading absence.
+MISSING_TOOLS=""
+for t in ss iptables nft systemctl lsmod sysctl findmnt stat awk sed grep; do
+  have "$t" || MISSING_TOOLS="$MISSING_TOOLS $t"
+done
+if [ -n "$MISSING_TOOLS" ]; then
+  chk collect.missing_tools WARN "$MISSING_TOOLS" "these collection tools are not on PATH, so every check depending on one reports NA or a degraded result — NOT an absent control. If this includes iptables/nft/ss on a host that plainly has them, PATH is missing /sbin and /usr/sbin: re-run with 'sudo -i' or an explicit PATH"
+else
+  chk collect.missing_tools PASS "all core collection tools present" ""
+fi
 # End-of-life / very old kernels are their own finding; compare against distro current.
 if have needrestart; then
   raw "needrestart (reboot required?)"
@@ -1170,12 +1188,21 @@ sec FIREWALL
 FW=""
 if have nft && [ "$AM_ROOT" = "1" ]; then
   raw "nftables ruleset"; run nft list ruleset
-  nft list ruleset 2>/dev/null | grep -q 'chain' && FW="$FW nftables"
+  nft list ruleset 2>/dev/null | grep -qE '^[[:space:]]*(chain|table)' && FW="$FW nftables"
 fi
 if have iptables && [ "$AM_ROOT" = "1" ]; then
   raw "iptables -S"; run iptables -S
   raw "ip6tables -S"; run ip6tables -S
-  iptables -S 2>/dev/null | grep -qvE '^-P|^$' && FW="$FW iptables"
+  # Count real rules, and separately treat a non-ACCEPT default policy as a firewall in its
+  # own right — a host whose entire policy is "-P INPUT DROP" is filtering, not unprotected.
+  # (Positive match rather than `grep -qv`: the inverted-quiet idiom is not portable.)
+  IPT_OUT="$(iptables -S 2>/dev/null)"
+  IPT_RULES="$(printf '%s\n' "$IPT_OUT" | grep -cE '^-(A|I|N)')"
+  IPT_DENY="$(printf '%s\n' "$IPT_OUT" | grep -cE '^-P [A-Z]+ (DROP|REJECT)')"
+  { [ "${IPT_RULES:-0}" -gt 0 ] || [ "${IPT_DENY:-0}" -gt 0 ]; } && FW="$FW iptables"
+  IPT6_OUT="$(ip6tables -S 2>/dev/null)"
+  { [ "$(printf '%s\n' "$IPT6_OUT" | grep -cE '^-(A|I|N)')" -gt 0 ] \
+    || [ "$(printf '%s\n' "$IPT6_OUT" | grep -cE '^-P [A-Z]+ (DROP|REJECT)')" -gt 0 ]; } && FW="$FW ip6tables"
 fi
 if have ufw; then raw "ufw status"; run ufw status verbose; ufw status 2>/dev/null | grep -qi '^Status: active' && FW="$FW ufw"; fi
 if have firewall-cmd; then raw "firewalld"; run firewall-cmd --state; run firewall-cmd --list-all-zones | head -80; firewall-cmd --state 2>/dev/null | grep -q running && FW="$FW firewalld"; fi
