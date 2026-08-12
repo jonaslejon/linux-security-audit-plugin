@@ -25,19 +25,27 @@ a given host emits fewer, and reports the rest as `NA`.
   and systemd all load them legitimately — so the section enumerates and attributes rather
   than alarms.
 
+## [1.1.2] — 2026-08-12
+
 ### Fixed
 
-- Symlinks were judged by their own mode, which is always `0777`. `/bin -> usr/bin` therefore
-  reported as `WORLD-WRITABLE`, and the same inflated `web.config_writable` and
-  `bootchain.unit_inputs`. Targets are now dereferenced, dangling links skipped, and the
-  writability scans no longer match symlinks.
-- The TLS probe treated any port printing a cipher as a TLS endpoint, but OpenSSL prints
-  `Cipher : 0000` when no handshake occurred — so SSH on 22 and plaintext HTTP on 80 received
-  a full battery of bogus weak-cipher `FAIL`s. A named cipher is now required.
-- Weak-cipher probes reported `ACCEPTED` for families the local openssl cannot offer, recording
-  the client's inability to ask as the server's answer. Families are pre-checked with
-  `openssl ciphers` and reported `NA` when untestable, and a completed handshake must negotiate
-  a cipher inside the tested family before it counts.
+Three false-positive classes, all found during a live EL8 audit and all of which manufactured
+findings that did not exist:
+
+- **Symlinks judged by their own mode.** A symlink's mode is always `0777` and carries no
+  information, so `/bin -> usr/bin` reported as `WORLD-WRITABLE /bin (777)` on every Linux
+  host. The same inflated `web.config_writable` (`/etc/httpd/{run,modules,logs,state}` are all
+  symlinks) and `bootchain.unit_inputs`. `path_risk` now dereferences and judges the target,
+  dangling links are skipped, and the writability scans no longer match symlinks at all.
+- **Non-TLS ports probed as TLS endpoints.** OpenSSL prints `Cipher : 0000` when no handshake
+  occurred, which the endpoint test accepted as a valid cipher — so SSH on 22 and plaintext
+  HTTP on 80 were treated as TLS and given a full battery of bogus weak-cipher `FAIL`s. A named
+  cipher is now required.
+- **Weak-cipher probes bounded by the local openssl.** Families the local build cannot offer
+  were reported `ACCEPTED`, recording the client's inability to ask as the server's answer.
+  Each family is now pre-checked with `openssl ciphers` and reported `NA` when untestable, and
+  a completed handshake must negotiate a cipher *inside* the tested family before it counts —
+  which also catches `-cipher` failing to constrain and the server picking something modern.
 
 ## [1.1.1] — 2026-08-12
 
@@ -146,6 +154,7 @@ Initial release. 249 checks across 31 areas.
 - Not a compliance tool: no control IDs are emitted, and none should be inferred.
 
 [1.2.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.2.0
+[1.1.2]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.2
 [1.1.1]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.1
 [1.1.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.0.0
