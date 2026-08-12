@@ -4599,6 +4599,102 @@ if [ "${MID_SIZE:-0}" -le 1 ]; then
 fi
 method_reset
 
+# ----------------------------------------------------------------- 28. eBPF
+# eBPF runs attacker-reachable code IN THE KERNEL without loading a module, so
+# kernel.modules_disabled=1 — the strongest anti-LKM-rootkit control this audit recommends —
+# does not constrain it at all. Published eBPF rootkits (TripleCross, ebpfkit, boopkit) hook
+# syscalls, hide processes and files, sniff credentials and implement backdoor triggers this way.
+#
+# Loaded programs are NOT inherently suspicious: Cilium, Calico, Falco, Datadog, Pixie, systemd
+# and modern container runtimes all load them legitimately. The audit's job is to ENUMERATE and
+# ATTRIBUTE, and to flag what cannot be attributed.
+sec EBPF
+if [ "$OFFLINE" = "1" ]; then
+  chk ebpf.context NA "offline (--root)" "loaded eBPF programs are runtime state; audit the booted host"
+elif [ -n "$CTR" ]; then
+  chk ebpf.context NA "inside a $CTRTYPE container" "the BPF subsystem belongs to the host kernel"
+else
+  raw "eBPF configuration"
+  UBD="$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null)"
+  JITH="$(cat /proc/sys/net/core/bpf_jit_harden 2>/dev/null)"
+  JITE="$(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null)"
+  STATS="$(cat /proc/sys/kernel/bpf_stats_enabled 2>/dev/null)"
+  printf '  unprivileged_bpf_disabled=%s bpf_jit_harden=%s bpf_jit_enable=%s bpf_stats_enabled=%s\n' \
+    "${UBD:-n/a}" "${JITH:-n/a}" "${JITE:-n/a}" "${STATS:-n/a}"
+  case "$UBD" in
+    1) chk ebpf.unprivileged PASS "unprivileged_bpf_disabled=1" "only CAP_BPF/CAP_SYS_ADMIN can load programs" ;;
+    2) chk ebpf.unprivileged PASS "unprivileged_bpf_disabled=2" "unprivileged BPF disabled until the first privileged use, then locked" ;;
+    0) chk ebpf.unprivileged FAIL "unprivileged_bpf_disabled=0" "ANY local user can load eBPF programs into the kernel. The verifier is the only thing between an unprivileged user and kernel code execution, and it has a long CVE history of being bypassed. Set to 1" ;;
+    *) chk ebpf.unprivileged NA "${UBD:-not present}" "tunable absent on this kernel" ;;
+  esac
+  [ -n "$STATS" ] && [ "$STATS" = "1" ] && chk ebpf.stats INFO "bpf_stats_enabled=1" "run-time accounting is on; small overhead, useful for spotting a busy hidden program"
+
+  # ---- what is actually loaded ----
+  if have bpftool && [ "$AM_ROOT" = "1" ]; then
+    raw "loaded eBPF programs (bpftool prog list)"
+    run bpftool prog list 2>/dev/null | head -60
+    PROGS="$(bpftool prog list 2>/dev/null)"
+    NPROG="$(printf '%s\n' "$PROGS" | grep -cE '^[0-9]+:')"
+    chk ebpf.programs_loaded INFO "${NPROG:-0} program(s) loaded" "attribute each to a known agent; anything unaccounted for is the finding"
+    raw "programs by type"
+    printf '%s\n' "$PROGS" | grep -oE '^[0-9]+: [a-z_]+' | awk '{print $2}' | sort | uniq -c | sort -rn | sed 's/^/  /'
+    # types that hook syscalls, packets or LSM decisions are the rootkit-capable ones
+    HOOKY="$(printf '%s\n' "$PROGS" | grep -cE '^[0-9]+: (kprobe|kretprobe|tracepoint|raw_tracepoint|fentry|fexit|lsm|xdp|sched_cls|sched_act|cgroup_skb|sock_ops|sk_msg|sk_skb)')"
+    [ "${HOOKY:-0}" -gt 0 ] && chk ebpf.hooking_programs WARN "${HOOKY} program(s) of syscall/packet/LSM-hooking types" "kprobe, fentry, tracepoint, lsm, xdp and tc types can observe or ALTER syscall arguments, return values and packets. Legitimate for observability and CNI agents — confirm each belongs to one, because this is exactly how an eBPF rootkit hides processes, files and network connections"
+    raw "programs with no owning process (orphaned or pinned — survives the loader exiting)"
+    printf '%s\n' "$PROGS" | grep -vE 'pids ' | grep -E '^[0-9]+:' | head -20 | sed 's/^/  /'
+    ORPH="$(printf '%s\n' "$PROGS" | grep -E '^[0-9]+:' | grep -vc 'pids ')"
+    [ "${ORPH:-0}" -gt 0 ] && chk ebpf.orphan_programs WARN "${ORPH} program(s) with no listed owning process" "a program stays loaded after its loader exits if it is pinned or still attached. Normal for CNI and systemd; for anything else it is persistence without a process to notice"
+    raw "eBPF maps"
+    run bpftool map list 2>/dev/null | head -30
+    raw "cgroup-attached programs"
+    run bpftool cgroup tree 2>/dev/null | head -20
+    raw "BPF LSM programs (can enforce policy — or subvert it)"
+    printf '%s\n' "$PROGS" | grep -E '^[0-9]+: lsm' | sed 's/^/  /'
+    printf '%s' "$PROGS" | grep -qE '^[0-9]+: lsm' && chk ebpf.lsm_programs WARN "BPF LSM programs attached" "these participate in security decisions. Defensive tools (Falco, Tetragon, Tracee) use them legitimately; an attacker uses them to approve their own actions. Attribute every one"
+  elif have bpftool; then
+    chk ebpf.programs_loaded NA "bpftool requires root to list programs" "loaded eBPF is not enumerable as a normal user — not evidence that none is loaded"
+  else
+    chk ebpf.programs_loaded NA "bpftool not installed" "loaded eBPF programs cannot be enumerated. On a host that runs any eBPF-based agent this is a real blind spot: install bpftool (linux-tools / bpftool package)"
+  fi
+
+  # ---- pinned objects: persistence across reboot-free process death ----
+  if [ -d /sys/fs/bpf ]; then
+    raw "pinned BPF objects in bpffs (/sys/fs/bpf)"
+    find /sys/fs/bpf -maxdepth 3 -print 2>/dev/null | head -25 | sed 's/^/  /'
+    NPIN="$(find /sys/fs/bpf -mindepth 1 -maxdepth 3 -print 2>/dev/null | grep -c .)"
+    [ "${NPIN:-0}" -gt 0 ] && chk ebpf.pinned_objects INFO "${NPIN} pinned object(s)" "pinning keeps a program or map alive with no owning process, and it is how an eBPF implant persists without a file on disk or a kernel module. Expected for Cilium/Calico; attribute anything else"
+  fi
+
+  # ---- packet-path attachments: XDP and tc ----
+  raw "XDP programs attached to interfaces"
+  ip link show 2>/dev/null | grep -iE 'xdp|prog/' | sed 's/^/  /'
+  XDPN="$(ip link show 2>/dev/null | grep -ciE 'xdp')"
+  [ "${XDPN:-0}" -gt 0 ] && chk ebpf.xdp_attached WARN "${XDPN} interface(s) with an XDP program" "XDP runs before the kernel network stack, so it can drop, rewrite or copy packets BEFORE anything else observes them — including tcpdump in some modes. Legitimate for high-performance CNI and DDoS filtering; otherwise it is invisible traffic interception"
+  if have tc; then
+    raw "tc BPF filters (clsact/ingress/egress)"
+    for i in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | head -10); do
+      f="$(tc filter show dev "$i" ingress 2>/dev/null | grep -i bpf | head -2)"
+      [ -n "$f" ] && printf '  %s ingress: %s\n' "$i" "$(printf '%s' "$f" | tr '\n' ' ' | cut -c1-90)"
+    done
+  fi
+
+  # ---- who is allowed to load ----
+  raw "processes and files holding CAP_BPF / CAP_PERFMON / CAP_SYS_ADMIN"
+  if [ "$QUICK" != "1" ] && have getcap; then
+    for d in $SCANDIRS; do getcap -r "$d" 2>/dev/null; done | grep -iE 'cap_bpf|cap_perfmon' | head -10 | sed 's/^/  /'
+    CAPB="$(for d in $SCANDIRS; do getcap -r "$d" 2>/dev/null; done | grep -ciE 'cap_bpf|cap_perfmon')"
+    [ "${CAPB:-0}" -gt 0 ] && chk ebpf.cap_bpf_files WARN "${CAPB} binary/binaries with CAP_BPF or CAP_PERFMON" "these can load eBPF without full root. Intended for observability agents; on anything else it is a quiet route to kernel code"
+  fi
+  # lockdown interaction — worth stating because it is the control that actually stops this
+  LD="$(cat /sys/kernel/security/lockdown 2>/dev/null | grep -oE '\[[a-z]+\]' | tr -d '[]')"
+  case "$LD" in
+    confidentiality) chk ebpf.lockdown PASS "lockdown=confidentiality" "bpf() access to kernel memory is blocked, which is the strongest available constraint on eBPF abuse — and the reason lsa-trace.sh cannot run here either" ;;
+    integrity) chk ebpf.lockdown INFO "lockdown=integrity" "some BPF restrictions apply; kernel-memory reads are still possible in places" ;;
+    *) chk ebpf.lockdown INFO "lockdown=${LD:-none}" "with kernel.modules_disabled=1 set but no lockdown, eBPF remains an unconstrained in-kernel execution path — the LKM door is shut while this one is open" ;;
+  esac
+fi
+
 # ------------------------------------------------------------ 28. DOCKER HOST
 # The daemon and the containers it runs, audited FROM THE HOST. Deliberately scoped to what a
 # host audit can establish: daemon configuration and running-container posture. Build-time

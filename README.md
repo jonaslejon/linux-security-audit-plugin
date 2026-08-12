@@ -20,7 +20,7 @@ Then ask Claude to audit a host, or point it at an image.
 
 ## What it looks at
 
-258 checks across 32 areas, including:
+262 checks across 33 areas, including:
 
 - **Kernel** — sysctls, boot parameters, module blacklists, lockdown, CPU mitigations
 - **Filesystem** — mount options (`nosuid`/`noexec`/`nodev`), SUID/SGID, capabilities, world-writable paths
@@ -29,6 +29,7 @@ Then ask Claude to audit a host, or point it at an image.
 - **Boot and service-start trust chain** — everything root reads on the way up: `EnvironmentFile`, `ld.so` search paths, udev `RUN`, plus what root processes currently hold open
 - **Network** — firewall policy per direction including **egress**, listener/rule reconciliation, bind-address discipline, exposed services
 - **TLS** — cipher and protocol validation by active probe, and whether mutual TLS is *enforced* rather than merely requested
+- **eBPF** — loaded programs by type, unattributed and pinned objects, XDP and tc attachments, BPF LSM programs, and `CAP_BPF` holders. `modules_disabled=1` does not constrain eBPF, so an in-kernel implant needs no module
 - **Services** — SSH (public-key-only enforcement, forwarding channels, `Match` block overrides), web servers, databases, and insecure-by-default daemons
 - **Secrets** — cleartext credentials and private keys on disk, **reported with values redacted**
 - **Containers and Docker** — daemon hardening (`userns-remap`, `icc`, default `no-new-privileges`), running-container posture (privileged, mounted `docker.sock`, missing memory/PID limits, writable rootfs), and credentials baked into image layers

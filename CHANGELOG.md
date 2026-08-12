@@ -7,6 +7,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Counts quoted below are the checks emitted on a host where every subsystem is present;
 a given host emits fewer, and reports the rest as `NA`.
 
+## [1.2.0] — 2026-08-12
+
+### Added
+
+- **eBPF section.** eBPF executes attacker-reachable code in the kernel *without loading a
+  module*, so `kernel.modules_disabled=1` — the strongest anti-LKM-rootkit control this audit
+  recommends — does not constrain it at all. Published eBPF rootkits (TripleCross, ebpfkit,
+  boopkit) hook syscalls, hide processes and files, and implement backdoor triggers this way.
+  Coverage: `unprivileged_bpf_disabled` semantics (0/1/2), JIT hardening, loaded programs by
+  type with the syscall/packet/LSM-hooking types called out, programs with no owning process,
+  maps, cgroup attachments, BPF LSM programs, pinned objects in `bpffs` (persistence with no
+  process and no file on disk), XDP attachments (which see and can rewrite packets before the
+  network stack, including before tcpdump), tc BPF filters, `CAP_BPF`/`CAP_PERFMON` holders,
+  and the kernel-lockdown interaction that actually constrains all of it.
+  Loaded programs are not treated as inherently suspicious — Cilium, Calico, Falco, Datadog
+  and systemd all load them legitimately — so the section enumerates and attributes rather
+  than alarms.
+
+### Fixed
+
+- Symlinks were judged by their own mode, which is always `0777`. `/bin -> usr/bin` therefore
+  reported as `WORLD-WRITABLE`, and the same inflated `web.config_writable` and
+  `bootchain.unit_inputs`. Targets are now dereferenced, dangling links skipped, and the
+  writability scans no longer match symlinks.
+- The TLS probe treated any port printing a cipher as a TLS endpoint, but OpenSSL prints
+  `Cipher : 0000` when no handshake occurred — so SSH on 22 and plaintext HTTP on 80 received
+  a full battery of bogus weak-cipher `FAIL`s. A named cipher is now required.
+- Weak-cipher probes reported `ACCEPTED` for families the local openssl cannot offer, recording
+  the client's inability to ask as the server's answer. Families are pre-checked with
+  `openssl ciphers` and reported `NA` when untestable, and a completed handshake must negotiate
+  a cipher inside the tested family before it counts.
+
 ## [1.1.1] — 2026-08-12
 
 ### Fixed
@@ -113,6 +145,7 @@ Initial release. 249 checks across 31 areas.
   been exercised end-to-end on a booted Linux host.
 - Not a compliance tool: no control IDs are emitted, and none should be inferred.
 
+[1.2.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.2.0
 [1.1.1]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.1
 [1.1.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.0.0
