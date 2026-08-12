@@ -44,6 +44,67 @@ Then ask Claude to audit a host, or point it at an image.
 | Mounted image | `--root /mnt` | configuration only; runtime checks report `NA` |
 | Container | run inside it | container-level checks; host-owned ones report `NA` |
 
+## Running it
+
+The plugin drives this for you, but the collector is a standalone script with no dependencies
+beyond a POSIX shell and the tools it audits:
+
+```bash
+S=~/.claude/plugins/.../skills/linux-security-audit/scripts/lsa-collect.sh
+
+# a live host, over SSH, leaving nothing behind on the target
+ssh -p 22 user@host 'sudo bash -s' < "$S" > report.txt
+
+# locally
+sudo bash "$S" > report.txt
+
+# a mounted image or golden template — configuration only
+sudo bash "$S" --root /mnt/image > image-report.txt
+
+# a container image
+docker run --rm -i <image> bash -s < "$S" > image-report.txt
+```
+
+| Flag | Effect |
+|---|---|
+| `--quick` | Skip whole-filesystem walks (SUID, world-writable, secrets). Use on large or slow storage |
+| `--passive` (`--no-probe`) | Disable every active check — no loopback connections, no NTP queries |
+| `--root PATH` | Offline mode against a mounted filesystem; runtime checks report `NA` |
+| `--apt-update` | Also run `apt-get update` to test repo signatures. **The only thing that writes anything** |
+| `--out FILE` | Write to a file on the target instead of stdout |
+| `--force` | Run on a non-Linux kernel anyway. Development only; results are not meaningful |
+
+Runtime observation of what root actually opens at boot and service start is a separate script.
+Start with the preflight, which changes nothing and reports which backends this host allows:
+
+```bash
+sudo bash lsa-trace.sh --preflight      # what is possible here, without changing anything
+sudo bash lsa-trace.sh --live 60        # passive; falls back to /proc polling if no tracer
+sudo bash lsa-trace.sh --unit nginx     # restarts that service; asks first
+```
+
+## What the output looks like
+
+One `CHECK` line per control, plus raw evidence blocks for the things needing human judgement.
+Illustrative — the note field carries the reasoning, which is what makes a finding report-ready:
+
+```
+CHECK|sudo.env_keep|FAIL|env_keep += "LD_PRELOAD"|preserving the dynamic-linker environment
+  across sudo lets any sudo-capable user load their own library into a root process - a direct,
+  unconditional root shell|static
+CHECK|firewall.policy_output|FAIL|OUTPUT=ACCEPT|UNRESTRICTED EGRESS. Inbound filtering only stops
+  the first step; with open egress a compromised process can reach any C2 endpoint, exfiltrate to
+  any destination, pull a second stage, and open a reverse shell outbound|runtime
+CHECK|tls.443.mtls|WARN|requested but NOT enforced|the server asks for a client certificate yet
+  completed the handshake without one - permissive mTLS authenticates nobody|active
+CHECK|sudo.policy_readable|NA|/etc/sudoers could not be read|0440 root:root - re-run as root. No
+  sudo verdict is issued, because an empty read is not an absent rule|static
+```
+
+(Wrapped here for width; each check is a single line.)
+
+Grep it: `grep '^CHECK|' report.txt | grep -v '|PASS|'`
+
 ## The verdict model
 
 Output is one line per check:
