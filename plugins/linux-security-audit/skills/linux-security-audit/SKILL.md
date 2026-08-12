@@ -60,8 +60,9 @@ reason not to.
 ### 1. Scope
 
 Establish: which host(s), is root/sudo available, is it production, and is there a baseline to
-audit against (CIS Level 1/2, the user's own hardening guide, "everything"). Default baseline is
-`references/checklist.md`, which merges the user's guide with KSPP, CIS and madaidan's guide.
+audit against (CIS Level 1/2, a site-specific standard, "everything"). Default baseline is
+`references/checklist.md`, which merges KSPP, CIS and madaidan's Linux hardening guide with
+practitioner hardening practice.
 
 ### 2. Collect
 
@@ -70,7 +71,7 @@ commands, both for speed and so nothing is silently skipped.
 
 ```bash
 SK=~/.claude/skills/linux-security-audit/scripts/lsa-collect.sh
-OUT=<scratchpad>/lsa-<host>-$(date +%Y%m%d).txt
+OUT=/tmp/lsa-<host>-$(date +%Y%m%d).txt      # or any working directory
 
 # local
 sudo bash "$SK" > "$OUT"
@@ -127,7 +128,7 @@ and mark those as unverified rather than passing.
 A useful pattern for a fleet: audit the image passively at build time, then audit the running host
 actively — a delta between them is configuration drift after deploy.
 
-Always save raw output to the scratchpad and cite line numbers from it as evidence. Multiple
+Always save raw output to a working directory and cite line numbers from it as evidence. Multiple
 hosts: collect them all first, then compare — drift between supposedly-identical hosts is itself
 a finding.
 

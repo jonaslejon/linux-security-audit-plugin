@@ -46,7 +46,7 @@ Verify with `cat /proc/cmdline`. Persist in `GRUB_CMDLINE_LINUX_DEFAULT` in `/et
 ### CPU vulnerability mitigations — POLICY, measure before applying
 
 `mitigations=auto,nosmt` is the KSPP recommendation and enables the defaults *plus* disables SMT
-where a vulnerability needs it. The explicit form from the user's guide:
+where a vulnerability needs it. The explicit form:
 
 ```
 spectre_v2=on spec_store_bypass_disable=on tsx=off tsx_async_abort=full,nosmt \

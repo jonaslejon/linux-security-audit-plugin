@@ -27,7 +27,7 @@ finding on a web server and correct on a NAT gateway.
 executing files from it, `nodev` blocks device nodes. Together they remove the standard
 post-exploitation pattern of *drop a payload in a writable directory and run it*.
 
-Recommended `/etc/fstab` (from the user's guide; `/tmp` and `/var` shown as bind mounts, which is
+Recommended `/etc/fstab` (`/tmp` and `/var` shown as bind mounts, which is
 what you use when they are not separate physical partitions):
 
 ```
