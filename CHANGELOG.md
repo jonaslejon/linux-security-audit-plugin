@@ -7,6 +7,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Counts quoted below are the checks emitted on a host where every subsystem is present;
 a given host emits fewer, and reports the rest as `NA`.
 
+## [1.3.0] — 2026-08-12
+
+### Added
+
+- **Dependency-free `/proc` backend for `lsa-trace.sh --live`.** Every tracing backend
+  previously required `bpftrace`, `opensnoop`, `fatrace` or `strace` — which is precisely what
+  a hardened image strips, and which this project's own `packages.prohibited` check reports as
+  a finding when present. Requiring one in order to run the tracer was self-defeating, and
+  installing one is a persistent change to the audited host.
+
+  The new backend samples every root process's open file descriptors (`/proc/PID/fd`) and
+  mapped files (`/proc/PID/maps`) for the requested window and feeds them through the existing
+  `path_risk()`. It needs nothing but a readable `/proc` as root, so it works where every other
+  backend is unavailable. `--preflight` advertises it instead of refusing.
+
+  Its limitation is printed rather than left implicit: polling *samples*, so a file opened and
+  closed entirely between two samples is missed. Confidence is partial, unlike the
+  event-driven backends.
+
+  Contributed patch, adjusted before merge: sampling interval raised from 0.3s to 1s (at 0.3s
+  on a host with ~400 processes the poller issues roughly 6.4M `readlink()` calls per minute,
+  which is real load on a production box, and a warning now fires above 250 processes with a
+  sub-second interval); fractional `sleep` is a GNU/BSD extension so the interval is probed
+  once and falls back to 1s, because busybox and POSIX `sleep` take integers and a minimal
+  hardened image is exactly where busybox lives; and the ASCII conversion was completed across
+  the whole file rather than only the added lines.
+
+### Fixed
+
+- `v1.1.2` was tagged without a changelog entry, and its three false-positive fixes were
+  written up under `1.2.0` — attributing them to a release they did not ship in. Each version
+  now has a matching entry.
+
 ## [1.2.0] — 2026-08-12
 
 ### Added
@@ -153,6 +186,7 @@ Initial release. 249 checks across 31 areas.
   been exercised end-to-end on a booted Linux host.
 - Not a compliance tool: no control IDs are emitted, and none should be inferred.
 
+[1.3.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.3.0
 [1.2.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.2.0
 [1.1.2]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.2
 [1.1.1]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.1

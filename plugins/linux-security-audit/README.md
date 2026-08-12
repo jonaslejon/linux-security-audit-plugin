@@ -72,7 +72,9 @@ Writes nothing by default. No config is modified, no service restarted, no packa
 - Filesystem walks do read I/O proportional to disk size — use `--quick` on large storage.
 
 A separate script, `lsa-trace.sh`, observes what root processes actually open at boot and
-service start. It runs a preflight first and refuses rather than half-working when hardening
+service start. It uses `bpftrace`, `opensnoop` or `fatrace` when present, and otherwise falls
+back to a dependency-free `/proc` snapshot poller that needs no tracer installed — which matters,
+because a hardened image strips exactly those tools. It runs a preflight first and refuses rather than half-working when hardening
 blocks it, because on a properly hardened host `ptrace_scope=3` and kernel lockdown are
 supposed to stop exactly this.
 
