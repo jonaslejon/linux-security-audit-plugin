@@ -4,8 +4,10 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Counts quoted below are the checks emitted on a host where every subsystem is present;
-a given host emits fewer, and reports the rest as `NA`.
+Check counts quoted in earlier entries were taken from the development machine, which runs
+almost none of the audited subsystems and therefore emits close to the *minimum*, not the
+maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
+depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
 ## [1.3.0] — 2026-08-12
 

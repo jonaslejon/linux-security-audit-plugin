@@ -20,7 +20,9 @@ Then ask Claude to audit a host, or point it at an image.
 
 ## What it looks at
 
-262 checks across 33 areas, including:
+**450+ distinct checks across 33 areas.** The number a given host emits is a subset — sections
+for subsystems it does not run collapse to a single `NA`, and a host with Docker, a web server,
+TLS listeners and eBPF programs loaded emits far more than a minimal one. Coverage includes:
 
 - **Kernel** — sysctls, boot parameters, module blacklists, lockdown, CPU mitigations
 - **Filesystem** — mount options (`nosuid`/`noexec`/`nodev`), SUID/SGID, capabilities, world-writable paths
