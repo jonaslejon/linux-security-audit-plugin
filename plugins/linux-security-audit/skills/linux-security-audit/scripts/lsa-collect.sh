@@ -4509,6 +4509,120 @@ if [ "${MID_SIZE:-0}" -le 1 ]; then
 fi
 method_reset
 
+# ------------------------------------------------------------ 28. DOCKER HOST
+# The daemon and the containers it runs, audited FROM THE HOST. Deliberately scoped to what a
+# host audit can establish: daemon configuration and running-container posture. Build-time
+# supply chain — image scanning, SBOM, signing, admission control — is a different lifecycle
+# stage and a different tool's job (Trivy, Syft, Cosign, Kyverno); this reports whether that
+# tooling exists rather than reimplementing it.
+sec DOCKER_HOST
+if ! have docker && [ ! -S /var/run/docker.sock ] && [ ! -f "$(rf /etc/docker/daemon.json)" ]; then
+  chk docker.present INFO "no docker on this host" ""
+else
+  DJSON="$(cat "$(rf /etc/docker/daemon.json)" 2>/dev/null)"
+  raw "/etc/docker/daemon.json"
+  printf '%s\n' "${DJSON:-  (absent — every setting below is at its default)}"
+  DINFO=""
+  if [ "$OFFLINE" = "0" ] && have docker && docker info >/dev/null 2>&1; then
+    DINFO="$(docker info 2>/dev/null)"
+    raw "docker info (security-relevant)"
+    printf '%s\n' "$DINFO" | grep -iE 'Security Options|seccomp|apparmor|selinux|userns|rootless|Cgroup|Storage Driver|Live Restore|Logging Driver|Server Version' | sed 's/^/  /'
+  fi
+  dj() { printf '%s' "$DJSON" | tr -d ' "' | grep -oE "$1:[^,}]*" | cut -d: -f2- | head -1; }
+
+  # --- the daemon controls, in rough order of value ---
+  if printf '%s' "$DJSON" | grep -q 'userns-remap' || printf '%s' "$DINFO" | grep -qi 'userns'; then
+    chk docker.userns_remap PASS "userns-remap configured" "container root maps to an unprivileged host uid, so a container escape lands as nobody rather than root"
+  else
+    chk docker.userns_remap FAIL "userns-remap not set" "container UID 0 IS host UID 0. Every other container control — capabilities, seccomp, read-only rootfs — is a layer in front of that fact, and user-namespace remapping is the one that removes it. Set \"userns-remap\": \"default\" in daemon.json. Costs: shared volumes need ownership rework, and --privileged/host-namespace containers stop working"
+  fi
+  case "$(dj icc)" in
+    false) chk docker.icc PASS "icc=false" "containers on the default bridge cannot reach each other" ;;
+    *) chk docker.icc WARN "icc not disabled (default true)" "any container on the default bridge can reach any other, so a compromised container scans and attacks its neighbours. Set \"icc\": false and give each stack its own user-defined network" ;;
+  esac
+  printf '%s' "$DJSON" | grep -q 'no-new-privileges.*true' \
+    && chk docker.no_new_privs_default PASS "no-new-privileges default true" "" \
+    || chk docker.no_new_privs_default WARN "no-new-privileges not defaulted" "set it in daemon.json so every container gets it without relying on each run command"
+  case "$(dj live-restore)" in
+    true) chk docker.live_restore PASS "live-restore=true" "containers survive a daemon restart, so security patching the daemon is not an outage" ;;
+    *) chk docker.live_restore INFO "live-restore not enabled" "a daemon restart stops every container, which in practice delays daemon patching" ;;
+  esac
+  case "$(dj userland-proxy)" in
+    false) chk docker.userland_proxy PASS "userland-proxy=false" "" ;;
+    *) chk docker.userland_proxy INFO "userland-proxy enabled (default)" "the proxy binds published ports in userspace and bypasses some iptables rules; false is preferred where the kernel supports hairpin NAT" ;;
+  esac
+  INSEC="$(printf '%s' "$DJSON" | tr -d ' \n"' | grep -oE 'insecure-registries:\[[^]]*\]')"
+  [ -n "$INSEC" ] && chk docker.insecure_registries FAIL "$INSEC" "images are pulled over plaintext HTTP or with TLS verification disabled — an on-path attacker substitutes the image, and the container runs their code with whatever privileges it was granted"
+  printf '%s' "$DJSON" | grep -q 'default-ulimits' \
+    && chk docker.default_ulimits PASS "default-ulimits set" "" \
+    || chk docker.default_ulimits WARN "no default-ulimits" "no per-container file-descriptor or process ceiling by default; one container can exhaust host resources"
+  printf '%s' "$DJSON" | grep -qE '"log-driver"|log-driver' \
+    && chk docker.log_driver PASS "log-driver configured: $(dj log-driver)" "" \
+    || chk docker.log_driver WARN "default json-file log driver, no rotation configured" "container logs grow until the disk fills; set log-driver with max-size/max-file, or ship them off-host"
+  printf '%s' "$DINFO" | grep -qi 'rootless' && chk docker.rootless PASS "rootless mode" "the daemon itself does not run as root"
+  printf '%s' "$DINFO" | grep -qi 'seccomp' && printf '%s' "$DINFO" | grep -qi 'seccomp.*unconfined' \
+    && chk docker.seccomp_default FAIL "default seccomp profile disabled" "every container gets the full syscall surface"
+
+  # --- running containers, from the host ---
+  if [ "$OFFLINE" = "0" ] && have docker && docker ps -q >/dev/null 2>&1; then
+    raw "RUNNING CONTAINER POSTURE"
+    CIDS="$(docker ps -q 2>/dev/null | head -40)"
+    NC="$(printf '%s' "$CIDS" | grep -c .)"
+    chk docker.running_count INFO "${NC} running container(s)" ""
+    PRIV=""; NOLIM=""; RWROOT=""; ROOTU=""; NONNP=""; SOCKMNT=""; HOSTNET=""; LATEST=""; NOCAPDROP=""
+    for c in $CIDS; do
+      insp="$(docker inspect "$c" 2>/dev/null)"
+      nm="$(printf '%s' "$insp" | grep -oE '"Name": "/[^"]+' | head -1 | cut -d/ -f2)"
+      printf '%s' "$insp" | grep -q '"Privileged": true' && PRIV="$PRIV $nm"
+      printf '%s' "$insp" | grep -qE '"Memory": 0' && printf '%s' "$insp" | grep -qE '"PidsLimit": (0|null)' && NOLIM="$NOLIM $nm"
+      printf '%s' "$insp" | grep -q '"ReadonlyRootfs": false' && RWROOT="$RWROOT $nm"
+      printf '%s' "$insp" | grep -qE '"User": ""' && ROOTU="$ROOTU $nm"
+      printf '%s' "$insp" | grep -q 'no-new-privileges' || NONNP="$NONNP $nm"
+      printf '%s' "$insp" | grep -qE '"NetworkMode": "host"' && HOSTNET="$HOSTNET $nm"
+      printf '%s' "$insp" | grep -qE 'docker\.sock' && SOCKMNT="$SOCKMNT $nm"
+      printf '%s' "$insp" | grep -qE '"Image": "[^"]*:latest"|"Image": "[^"@]*"' && LATEST="$LATEST $nm"
+      printf '%s' "$insp" | grep -qE '"CapDrop": \[[^]]*(ALL|all)' || NOCAPDROP="$NOCAPDROP $nm"
+      printf '  %-22s priv=%s ro-rootfs=%s user=%s net=%s\n' "$nm" \
+        "$(printf '%s' "$insp" | grep -oE '"Privileged": (true|false)' | awk '{print $2}')" \
+        "$(printf '%s' "$insp" | grep -oE '"ReadonlyRootfs": (true|false)' | awk '{print $2}')" \
+        "$(printf '%s' "$insp" | grep -oE '"User": "[^"]*"' | head -1 | cut -d'"' -f4)" \
+        "$(printf '%s' "$insp" | grep -oE '"NetworkMode": "[^"]*"' | cut -d'"' -f4)"
+    done
+    [ -n "$PRIV" ]    && chk docker.privileged_containers FAIL "$PRIV" "--privileged grants all capabilities, all devices and disables seccomp/AppArmor. It is not a container in any security sense; it is a process with a different filesystem view"
+    [ -n "$SOCKMNT" ] && chk docker.socket_in_container FAIL "$SOCKMNT" "the docker socket is mounted into these containers — an immediate and complete host takeover from inside any of them"
+    [ -n "$HOSTNET" ] && chk docker.host_network WARN "$HOSTNET" "--net=host removes network namespace isolation: the container binds host interfaces directly and sees all host traffic"
+    [ -n "$ROOTU" ]   && chk docker.container_root FAIL "$ROOTU" "no USER set — these run as root inside the container, which without userns-remap is root on the host"
+    [ -n "$NOLIM" ]   && chk docker.resource_limits FAIL "$NOLIM" "neither memory nor PID limits set. A fork bomb or memory leak in one container takes down every other workload on the host, and the OOM killer picks its victim by heuristic, not by importance. Set --memory and --pids-limit"
+    [ -n "$RWROOT" ]  && chk docker.readonly_rootfs WARN "$RWROOT" "writable root filesystem — an attacker modifies the running image and persists for the container's lifetime. Use --read-only with explicit tmpfs mounts"
+    [ -n "$NOCAPDROP" ] && chk docker.cap_drop WARN "$NOCAPDROP" "no 'cap_drop: ALL'. Docker's default set still includes CAP_CHOWN, CAP_SETUID, CAP_NET_RAW and others; drop all and add back only what is needed"
+    [ -n "$NONNP" ]   && chk docker.no_new_privs WARN "$NONNP" "no-new-privileges not set — a SUID binary inside the image can still raise privileges"
+    raw "published ports (0.0.0.0 exposes the container on every host interface)"
+    docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | head -20 | sed 's/^/  /'
+    docker ps --format '{{.Ports}}' 2>/dev/null | grep -q '0\.0\.0\.0' && \
+      chk docker.published_wildcard WARN "container ports published on 0.0.0.0" "same argument as host services: on a multi-homed host this exposes the container on the management network and VPN too. Publish as 127.0.0.1:port or a specific address"
+    raw "secrets baked into image layers (docker history)"
+    for img in $(docker ps --format '{{.Image}}' 2>/dev/null | sort -u | head -5); do
+      H="$(docker history --no-trunc "$img" 2>/dev/null | grep -iE '(PASSWORD|SECRET|TOKEN|API_?KEY|AWS_|PRIVATE KEY)' | head -3)"
+      [ -n "$H" ] && { printf '  %s:\n' "$img"; printf '%s\n' "$H" | sed 's/=[^ ]*/=<redacted>/g' | cut -c1-120 | sed 's/^/    /'
+        chk "docker.image_secret.$(printf '%s' "$img" | tr '/:' '__')" FAIL "$img" "a credential appears in an image layer. Layers are immutable and distributed with the image, so deleting the file in a later layer does NOT remove it — anyone who can pull the image can read it. Rebuild with BuildKit secret mounts and rotate the credential"; }
+    done
+    raw "images in use: pinned by digest, or floating?"
+    docker ps --format '{{.Image}}' 2>/dev/null | sort -u | sed 's/^/  /' | head -15
+    docker ps --format '{{.Image}}' 2>/dev/null | grep -qv '@sha256:' && \
+      chk docker.image_pinning WARN "images referenced by tag, not digest" "a tag is mutable: the image you audited is not necessarily the image that runs after the next pull. Pin by @sha256: digest for anything security-relevant"
+  elif [ "$OFFLINE" = "1" ]; then
+    chk docker.runtime NA "offline (--root)" "running-container posture needs a live daemon"
+  else
+    chk docker.runtime NA "docker daemon not reachable (or insufficient privilege)" "daemon configuration above was still checked from daemon.json"
+  fi
+
+  # --- supply-chain tooling: report presence, do not reimplement ---
+  DSCAN=""
+  for t in trivy grype syft cosign docker-bench-security dockle; do have "$t" && DSCAN="$DSCAN $t"; done
+  [ -n "$DSCAN" ] && chk docker.supplychain_tooling PASS "$DSCAN" "" \
+    || chk docker.supplychain_tooling INFO "no image scanning or signing tooling found" "image CVE scanning (Trivy/Grype), SBOM generation (Syft) and signature verification (Cosign) are build- and registry-stage controls that this host audit deliberately does not attempt. If images are built or pulled here, that pipeline needs its own gate — CIS Docker Benchmark coverage via docker-bench-security is the closest equivalent to this section"
+fi
+
 # --------------------------------------------------------------- 28. CONTAINER
 # Only meaningful when the audited thing IS a container (or an image run as one). The host's
 # container posture — socket permissions, privileged containers, daemon TLS — is covered in
