@@ -5,6 +5,10 @@ risk-ranked report — what to fix, in what order, with the exact change and its
 
 It is an auditing tool, not a hardening script. It changes nothing by default.
 
+**Requires Linux.** The collector refuses to run on any other kernel rather than emit a report
+full of controls that only look absent because `/proc`, `/sys` and the GNU userland are missing.
+Run it on the host, over SSH, or against a mounted Linux filesystem with `--root`.
+
 ## Install
 
 ```

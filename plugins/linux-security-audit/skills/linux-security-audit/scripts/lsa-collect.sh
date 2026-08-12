@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lsa-collect.sh — Linux Security Audit collector.
+# lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -30,6 +30,7 @@
 #                  auditing host's state. Preferred over chroot, which silently lets runtime
 #                  tools return "absent" and manufactures FAILs.
 #   --apt-update   also run 'apt-get update' to test repo signatures (writes the apt cache)
+#   --force        run on a non-Linux kernel anyway (development only; results are not meaningful)
 #   --out FILE     write to FILE instead of stdout
 #
 # PASSIVE vs ACTIVE
@@ -67,6 +68,7 @@ while [ $# -gt 0 ]; do
     --quick|--no-fs-scan) QUICK=1 ;;
     --no-probe|--passive) PROBE=0 ;;
     --apt-update) APTUPDATE=1 ;;
+    --force) FORCE_NON_LINUX=1 ;;
     --root) LSA_ROOT="${2%/}"; OFFLINE=1; PROBE=0; shift ;;
     --out) OUT="$2"; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -182,6 +184,26 @@ path_risk() {
 }
 trim() { printf '%s' "$1" | tr -s ' \t' ' ' | sed 's/^ *//;s/ *$//'; }
 
+# ---------------------------------------------------------------- OS GATE
+# This audits Linux. On any other kernel almost every check degrades to "absent" — /proc and
+# /sys are missing, the userland is BSD, and the collection tools are not there — which produces
+# a long list of FAIL and NA that reads like findings and is really just "wrong operating
+# system". Refuse rather than emit a misleading report.
+KERNEL_NAME="$(uname -s 2>/dev/null)"
+if [ "$KERNEL_NAME" != "Linux" ]; then
+  printf 'ERROR: this collector audits Linux. Detected kernel: %s\n\n' "${KERNEL_NAME:-unknown}"
+  printf 'Almost every check would report the control as absent — not because it is missing,\n'
+  printf 'but because /proc, /sys and the GNU userland this relies on are not present. That\n'
+  printf 'output would look like findings and would be wrong.\n\n'
+  printf 'Run it on the Linux host instead:\n'
+  printf '    ssh -p <port> <user>@<host> \047sudo bash -s\047 < %s > report.txt\n' "$(basename "$0")"
+  printf 'or against a mounted Linux filesystem:\n'
+  printf '    %s --root /mnt/image\n\n' "$(basename "$0")"
+  printf 'Pass --force to run anyway (development only: results are not meaningful).\n'
+  [ "${FORCE_NON_LINUX:-0}" = "1" ] || exit 2
+  printf '\n--force given; continuing on a non-Linux kernel. RESULTS ARE NOT MEANINGFUL.\n\n'
+fi
+
 AM_ROOT=0
 [ "$(id -u)" = "0" ] && AM_ROOT=1
 
@@ -239,7 +261,7 @@ for t in ss iptables nft systemctl lsmod sysctl findmnt stat awk sed grep; do
   have "$t" || MISSING_TOOLS="$MISSING_TOOLS $t"
 done
 if [ -n "$MISSING_TOOLS" ]; then
-  chk collect.missing_tools WARN "$MISSING_TOOLS" "these collection tools are not on PATH, so every check depending on one reports NA or a degraded result — NOT an absent control. If this includes iptables/nft/ss on a host that plainly has them, PATH is missing /sbin and /usr/sbin: re-run with 'sudo -i' or an explicit PATH"
+  chk collect.missing_tools WARN "$MISSING_TOOLS" "on a Linux host these are almost certainly present but not on PATH, so every check depending on one reports NA or a degraded result — NOT an absent control. If this includes iptables/nft/ss on a host that plainly has them, PATH is missing /sbin and /usr/sbin: re-run with 'sudo -i' or an explicit PATH"
 else
   chk collect.missing_tools PASS "all core collection tools present" ""
 fi

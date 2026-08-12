@@ -7,6 +7,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Counts quoted below are the checks emitted on a host where every subsystem is present;
 a given host emits fewer, and reports the rest as `NA`.
 
+## [1.1.1] — 2026-08-12
+
+### Fixed
+
+- **`PATH` missing the sbin directories.** A non-login shell — which is what
+  `ssh host 'sudo bash -s' < script` produces, the invocation this project documents — usually
+  has no `/sbin` or `/usr/sbin`. `have()` therefore returned false for `iptables`, `nft`, `ss`,
+  `sshd`, `auditctl`, `lsmod`, `sysctl` and `findmnt`, and every dependent check reported the
+  control as **absent on hosts where it was installed and running**. Reported in the field as
+  `firewall.active` returning `FAIL "none detected"` on a host with a live iptables ruleset;
+  the firewall was the visible symptom of a much broader silent degradation. The collector now
+  prepends the sbin directories itself.
+- **iptables detection ignored default policies.** A host whose entire ruleset was
+  `-P INPUT DROP` with no explicit rules was reported as having no firewall. Rules and
+  non-ACCEPT default policies are now both counted, and `ip6tables` is checked as well.
+- Replaced the `grep -qv` idiom, whose exit status is not portable between grep
+  implementations, with a positive match.
+
+### Added
+
+- `collect.missing_tools` — reports absent collection tools once and explicitly, so a missing
+  binary can no longer masquerade as a missing control.
+- **Refuses to run on a non-Linux kernel.** Previously it would emit a full report on, say,
+  macOS, where nearly every check degrades to absent — output that reads like findings and is
+  really just "wrong operating system". `--force` overrides, for development only.
+
 ## [1.1.0] — 2026-08-12
 
 ### Added
@@ -87,5 +113,6 @@ Initial release. 249 checks across 31 areas.
   been exercised end-to-end on a booted Linux host.
 - Not a compliance tool: no control IDs are emitted, and none should be inferred.
 
+[1.1.1]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.1
 [1.1.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jonaslejon/linux-security-audit-plugin/releases/tag/v1.0.0

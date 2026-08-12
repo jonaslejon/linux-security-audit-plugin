@@ -1,6 +1,6 @@
 {
   "name": "linux-security-audit",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Audit a Linux host's security hardening posture and produce a risk-ranked report, using both passive config inspection and active service probing. Runs against a live host, a mounted image (--root), or a container.",
   "author": { "name": "Jonas Lejon", "url": "https://github.com/jonaslejon" }
 }
