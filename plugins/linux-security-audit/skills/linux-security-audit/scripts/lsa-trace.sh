@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# lsa-trace.sh — observe what root processes ACTUALLY open, and flag any path an
+# lsa-trace.sh - observe what root processes ACTUALLY open, and flag any path an
 # unprivileged user can write. Complements the static BOOT_CHAIN analysis in lsa-collect.sh.
 #
 # THIS SCRIPT IS NOT READ-ONLY IN THE SAME SENSE AS THE COLLECTOR.
 #   --unit <name>   restarts a service (brief outage for that service)
 #   --boot arm      installs temporary audit rules and asks you to reboot
 #   --boot report   reads back what the armed rules recorded, then disarms
-#   --live <secs>   passive system-wide observation, changes nothing
+#   --live <secs>   passive system-wide observation, changes nothing. Uses bpftrace/opensnoop/
+#                   fatrace if present, else falls back to a dependency-free /proc snapshot poller
+#                   (open fds + mmaps of root procs) that works on hardened images with no tracer.
 #   --preflight     report which modes are possible on this host, change nothing
 # Every mode prints exactly what it will do and requires --yes to proceed.
 #
@@ -34,7 +36,7 @@ while [ $# -gt 0 ]; do
 done
 [ -z "$MODE" ] && { sed -n '2,20p' "$0"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
-[ "$MODE" = "preflight" ] || [ "$(id -u)" = "0" ] || { echo "ERROR: must run as root — tracing syscalls requires it."; exit 1; }
+[ "$MODE" = "preflight" ] || [ "$(id -u)" = "0" ] || { echo "ERROR: must run as root - tracing syscalls requires it."; exit 1; }
 
 # Most severe writability issue anywhere on a path (file or any ancestor directory).
 # Write access to a parent directory is enough to replace the file.
@@ -94,10 +96,10 @@ confirm() {
 }
 
 # ------------------------------------------------------------------ PREFLIGHT
-# A properly hardened host BLOCKS most tracing — that is the hardening working as
+# A properly hardened host BLOCKS most tracing - that is the hardening working as
 # designed. Establish what is possible WITHOUT changing anything, and never weaken
 # the system silently. Runs before every mode.
-PF_BPF=""; PF_PTRACE=""; PF_FAN=""; PF_AUDIT=""
+PF_BPF=""; PF_PTRACE=""; PF_FAN=""; PF_AUDIT=""; PF_PROC=""
 preflight() {
   echo "=== preflight: what can be traced on THIS host without changing it ==="
 
@@ -113,28 +115,35 @@ preflight() {
   if ! have bpftrace && ! have opensnoop-bpfcc && ! have opensnoop; then
     PF_BPF="unavailable: no bpftrace/bcc installed"
   elif [ "$LOCKDOWN" = "confidentiality" ]; then
-    PF_BPF="BLOCKED: kernel lockdown=confidentiality forbids bpf() access to kernel memory. Only a reboot with lockdown=integrity (or none) changes this — do NOT weaken a production host for an audit"
+    PF_BPF="BLOCKED: kernel lockdown=confidentiality forbids bpf() access to kernel memory. Only a reboot with lockdown=integrity (or none) changes this - do NOT weaken a production host for an audit"
   elif [ ! -e /sys/kernel/btf/vmlinux ] && [ ! -d /sys/kernel/debug/tracing ] && [ ! -d /sys/kernel/tracing ]; then
     PF_BPF="BLOCKED: no BTF and no tracefs. debugfs=off on the kernel cmdline removes /sys/kernel/debug; tracefs may still be mountable separately (see below)"
   else
     PF_BPF="OK"
-    [ "$LOCKDOWN" = "integrity" ] && PF_BPF="OK (lockdown=integrity — tracepoints work, some kernel-memory reads may not)"
+    [ "$LOCKDOWN" = "integrity" ] && PF_BPF="OK (lockdown=integrity - tracepoints work, some kernel-memory reads may not)"
   fi
 
   # --- ptrace (strace) ---
   case "${YAMA:-0}" in
-    3) PF_PTRACE="BLOCKED: kernel.yama.ptrace_scope=3 disables ptrace entirely and is ONE-WAY — it cannot be lowered without a reboot. strace mode is impossible here" ;;
+    3) PF_PTRACE="BLOCKED: kernel.yama.ptrace_scope=3 disables ptrace entirely and is ONE-WAY - it cannot be lowered without a reboot. strace mode is impossible here" ;;
     2) PF_PTRACE="OK for root (ptrace_scope=2 restricts to CAP_SYS_PTRACE)" ;;
     *) PF_PTRACE="OK" ;;
   esac
   have strace || PF_PTRACE="unavailable: strace not installed${PF_PTRACE:+ (and $PF_PTRACE)}"
   [ "$LOCKDOWN" = "confidentiality" ] && PF_PTRACE="BLOCKED: lockdown=confidentiality also restricts ptrace of privileged processes"
 
-  # --- fanotify (fatrace) — the most hardening-compatible option ---
+  # --- fanotify (fatrace) - the most hardening-compatible option ---
   if have fatrace; then
-    PF_FAN="OK (fanotify needs CAP_SYS_ADMIN only — unaffected by lockdown, yama or BPF restrictions)"
+    PF_FAN="OK (fanotify needs CAP_SYS_ADMIN only - unaffected by lockdown, yama or BPF restrictions)"
   else
-    PF_FAN="unavailable: fatrace not installed (apt install fatrace). This is the option most likely to work on a hardened host"
+    PF_FAN="unavailable: fatrace not installed (apt install fatrace)"
+  fi
+
+  # --- /proc snapshot poller (dependency-free fallback - needs nothing but a readable /proc as root) ---
+  if [ "$(id -u)" = 0 ] && [ -r /proc/1/status ]; then
+    PF_PROC="OK (dependency-free - samples open fds + mmaps of root processes; catches files held open or mapped during the window, misses opens that begin and end between samples)"
+  else
+    PF_PROC="unavailable: must be root with a readable /proc"
   fi
 
   # --- auditd (boot mode) ---
@@ -143,7 +152,7 @@ preflight() {
   else
     AENF="$(auditctl -s 2>/dev/null | awk '/^enabled/{print $2}')"
     if [ "$AENF" = "2" ]; then
-      PF_AUDIT="BLOCKED: the audit ruleset is IMMUTABLE (-e 2). Rules cannot be added until the next reboot. Making boot tracing possible would mean removing '-e 2' and rebooting — i.e. deliberately weakening the audit configuration of the host you are auditing"
+      PF_AUDIT="BLOCKED: the audit ruleset is IMMUTABLE (-e 2). Rules cannot be added until the next reboot. Making boot tracing possible would mean removing '-e 2' and rebooting - i.e. deliberately weakening the audit configuration of the host you are auditing"
     elif [ ! -w /etc/audit/rules.d ] 2>/dev/null; then
       PF_AUDIT="BLOCKED: /etc/audit/rules.d is not writable (read-only root or immutable image)"
     else
@@ -151,9 +160,10 @@ preflight() {
     fi
   fi
 
-  printf '\n  %-14s %s\n' "--live"  "$( [ "${PF_BPF%%:*}" = "OK" ] && echo "$PF_BPF" || echo "${PF_FAN}" )"
+  printf '\n  %-14s %s\n' "--live"  "$( if [ "${PF_BPF%%:*}" = "OK" ]; then echo "$PF_BPF"; elif [ "${PF_FAN%%:*}" = "OK" ]; then echo "$PF_FAN"; else echo "$PF_PROC"; fi )"
   printf '  %-14s bpf: %s\n' ""     "$PF_BPF"
   printf '  %-14s fanotify: %s\n' "" "$PF_FAN"
+  printf '  %-14s /proc-poll: %s\n' "" "$PF_PROC"
   printf '  %-14s %s\n' "--unit"   "bpf: ${PF_BPF} | ptrace: ${PF_PTRACE}"
   printf '  %-14s %s\n' "--boot"   "$PF_AUDIT"
   echo
@@ -161,12 +171,12 @@ preflight() {
   # Only refuse when the SELECTED mode has no viable mechanism.
   case "$MODE" in
     live)
-      case "$PF_BPF$PF_FAN" in *OK*) ;; *)
+      case "$PF_BPF$PF_FAN$PF_PROC" in *OK*) ;; *)
         echo "REFUSING: no tracing mechanism is available for --live without changing the host."
         echo
         echo "  Least-invasive way forward, in order of preference:"
         echo "   1. Install fatrace (fanotify). It needs no eBPF, no ptrace, and is unaffected by"
-        echo "      kernel lockdown — it is the option that works on the most hardened hosts."
+        echo "      kernel lockdown - it is the option that works on the most hardened hosts."
         echo "   2. Trace on a STAGING CLONE of this host instead. Same image and config, no"
         echo "      production risk, and the boot/service-start behaviour is what you want to observe."
         echo "   3. Rely on the static BOOT_CHAIN analysis and the /proc/<pid>/fd + maps snapshot in"
@@ -180,7 +190,7 @@ preflight() {
     unit)
       case "$PF_BPF$PF_PTRACE" in *OK*) ;; *)
         echo "REFUSING: neither eBPF nor ptrace is usable on this host, so a service start cannot be traced."
-        echo "  ptrace_scope=3 in particular is one-way and deliberate — treat it as a control working,"
+        echo "  ptrace_scope=3 in particular is one-way and deliberate - treat it as a control working,"
         echo "  not an obstacle. Use a staging clone, or rely on the static unit analysis."
         exit 2 ;;
       esac ;;
@@ -190,7 +200,7 @@ preflight() {
         echo
         echo "  This is the mode with the worst risk/benefit on a hardened host: it requires a"
         echo "  configuration change AND a reboot, and if the ruleset is immutable (-e 2) it needs"
-        echo "  TWO reboots — one to make rules mutable, one to capture the boot."
+        echo "  TWO reboots - one to make rules mutable, one to capture the boot."
         echo "  Prefer: trace the boot of a staging clone, or accept the static BOOT_CHAIN analysis."
         exit 2 ;;
       esac ;;
@@ -214,13 +224,45 @@ if [ "$MODE" = "live" ]; then
     OS="$(command -v opensnoop-bpfcc || command -v opensnoop)"
     timeout "$SECS" "$OS" -u 0 2>/dev/null | awk 'NR>1{pid=$1; comm=$2; path=$NF; print pid"\t"comm"\t"path}' > "$TMP"
   elif have fatrace; then
-    echo "(using fatrace — fanotify, no eBPF needed)"
+    echo "(using fatrace - fanotify, no eBPF needed)"
     timeout "$SECS" fatrace -f R 2>/dev/null | awk '{split($1,a,"("); comm=a[1]; path=$3; print "0\t"comm"\t"path}' > "$TMP"
   else
-    echo "ERROR: need one of bpftrace, opensnoop (bcc-tools), or fatrace."
-    echo "  Debian/Ubuntu: apt install bpftrace   (or bpfcc-tools, or fatrace)"
-    echo "  RHEL/Fedora:   dnf install bpftrace"
-    exit 1
+    # dependency-free fallback: no bpftrace/opensnoop/fatrace/strace on this host.
+    # Snapshot-poll /proc for root processes' open fds and mmapped files. Needs nothing but a
+    # readable /proc - works on the most hardened images, where the tracers above are stripped.
+    echo "(no bpftrace/opensnoop/fatrace - dependency-free /proc snapshot poller)"
+    echo "  sampling every ${LSA_POLL_INT:-1}s for ${SECS}s: root procs' open fds (/proc/PID/fd) +"
+    echo "  mapped files (/proc/PID/maps). Catches files held open or mmapped during the window; a"
+    echo "  file opened and closed entirely between two samples is missed. Confidence: partial."
+    # Sampling interval. Fractional sleep is a GNU/BSD extension - busybox and POSIX sleep take
+    # integers only, and a minimal hardened image (this backend's whole reason to exist) is
+    # exactly where busybox lives. Probe once and fall back rather than spinning with no delay.
+    _int="${LSA_POLL_INT:-1}"
+    if ! sleep 0.1 2>/dev/null; then
+      case "$_int" in *.*) _int=1; echo "  (this sleep(1) has no fractional support - interval forced to 1s)" ;; esac
+    fi
+    _nproc=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)
+    if [ "${_nproc:-0}" -gt 250 ] && [ "${_int%%.*}" = "0" ]; then
+      echo "  NOTE: ${_nproc} processes and a sub-second interval means millions of readlink()"
+      echo "        calls over ${SECS}s. On a busy host raise LSA_POLL_INT (e.g. LSA_POLL_INT=2)."
+    fi
+    _endu=$(( $(cut -d. -f1 /proc/uptime) + SECS ))
+    while [ "$(cut -d. -f1 /proc/uptime)" -lt "$_endu" ]; do
+      for pd in /proc/[0-9]*; do
+        [ -r "$pd/status" ] || continue
+        [ "$(awk '/^Uid:/{print $2; exit}' "$pd/status" 2>/dev/null)" = 0 ] || continue
+        _pid=${pd#/proc/}
+        _comm=$(tr -d '\n' < "$pd/comm" 2>/dev/null); [ -n "$_comm" ] || _comm='?'
+        for _fd in "$pd"/fd/*; do
+          _t=$(readlink "$_fd" 2>/dev/null) || continue
+          case "$_t" in /*) printf '%s\t%s\t%s\n' "$_pid" "$_comm" "${_t% (deleted)}" ;; esac
+        done
+        awk '$6 ~ /^\//{print $6}' "$pd/maps" 2>/dev/null | while IFS= read -r _m; do
+          printf '%s\t%s\t%s\n' "$_pid" "$_comm" "$_m"
+        done
+      done
+      sleep "$_int"
+    done | sort -u > "$TMP"
   fi
   echo "--- captured $(wc -l < "$TMP") open events ---"
   echo "--- root-opened paths that a non-root principal can write ---"
@@ -258,7 +300,7 @@ if [ "$MODE" = "unit" ]; then
     echo "--- paths opened during restart that are writable by a non-root principal ---"
     awk '{$1="";$2=""; sub(/^  /,""); sub(/^EXEC /,""); print}' "$TMP" | analyse_paths
   elif have strace; then
-    echo "(bpftrace not present — using strace on the restart, which follows forks)"
+    echo "(bpftrace not present - using strace on the restart, which follows forks)"
     systemctl stop "$UNIT" 2>/dev/null
     EXECSTART="$(systemctl show "$UNIT" -p ExecStart --value 2>/dev/null | sed 's/^{ *path=//; s/ *; *argv\[\]=/ /; s/ *; *ignore_errors.*//')"
     echo "  tracing: $EXECSTART"
@@ -284,7 +326,7 @@ if [ "$MODE" = "boot" ]; then
 It records file opens by uid=0 during the next boot. It changes audit configuration only,
 and increases audit log volume until you run '--boot report'. You must then REBOOT yourself."
       cat > "$AUDITRULES" <<'EOF'
-## temporary — installed by lsa-trace.sh, remove with: lsa-trace.sh --boot report
+## temporary - installed by lsa-trace.sh, remove with: lsa-trace.sh --boot report
 -a always,exit -F arch=b64 -S openat,open -F auid=-1 -F uid=0 -F success=1 -F key=lsa_boot
 -a always,exit -F arch=b64 -S execve -F uid=0 -F key=lsa_boot
 EOF
