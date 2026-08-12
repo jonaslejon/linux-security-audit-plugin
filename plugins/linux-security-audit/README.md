@@ -16,7 +16,7 @@ Then ask Claude to audit a host, or point it at an image.
 
 ## What it looks at
 
-249 checks across 31 areas, including:
+258 checks across 32 areas, including:
 
 - **Kernel** — sysctls, boot parameters, module blacklists, lockdown, CPU mitigations
 - **Filesystem** — mount options (`nosuid`/`noexec`/`nodev`), SUID/SGID, capabilities, world-writable paths
@@ -27,6 +27,7 @@ Then ask Claude to audit a host, or point it at an image.
 - **TLS** — cipher and protocol validation by active probe, and whether mutual TLS is *enforced* rather than merely requested
 - **Services** — SSH (public-key-only enforcement, forwarding channels, `Match` block overrides), web servers, databases, and insecure-by-default daemons
 - **Secrets** — cleartext credentials and private keys on disk, **reported with values redacted**
+- **Containers and Docker** — daemon hardening (`userns-remap`, `icc`, default `no-new-privileges`), running-container posture (privileged, mounted `docker.sock`, missing memory/PID limits, writable rootfs), and credentials baked into image layers
 - **Images and templates** — SSH host keys or entropy seeds baked into a golden image
 - **Drift** — where persisted config and running kernel disagree, and in which direction
 
