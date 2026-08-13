@@ -46,6 +46,14 @@ TLS listeners and eBPF programs loaded emits far more than a minimal one. Covera
 | Mounted image | `--root /mnt` | configuration only; runtime checks report `NA` |
 | Container | run inside it | container-level checks; host-owned ones report `NA` |
 
+In a container, controls that belong to the host or the orchestrator report `NA` with the reason
+rather than as findings against the image: mount layout, firewall, time, file-integrity monitoring
+and the interactive-login family. The collector also distinguishes a **workload** container (PID 1
+is the application, so runtime posture is a real finding) from an **inspection** container (PID 1
+is a shell, so the collector is reading an image and the seccomp profile, rootfs mode and
+namespaced sysctls belong to your `docker run`, not to the image). `container.context` reports
+which. Auditing a stock image this way yields single-digit findings instead of ~55.
+
 Use `--root` for an offline tree, never `chroot`. Inside a `chroot` the collector cannot tell it
 is offline: `systemctl`, `sudo -l` and `/proc` reads return "absent" rather than failing, and a
 check that turns a failed read into a `FAIL` has manufactured a finding. `--root` makes the

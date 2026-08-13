@@ -61,6 +61,15 @@ jobs:
       - name: Counts, versions and changelog agree
         run: bash tests/metadata-consistency.sh
 
+  # A check that emits nothing reads as a pass, which is the one failure mode the output format
+  # cannot express. This pins the ID universe so a check cannot vanish quietly.
+  check-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No check may stop emitting
+        run: bash tests/check-registry.sh
+
   # The collector's whole purpose is to run on a booted Linux host, so CI runs it on one. This is
   # the coverage that fixture tests cannot give: real /proc, real systemd, a real package database.
   live-smoke:
@@ -88,6 +97,10 @@ jobs:
         run: |
           bad=$(grep '^CHECK|' live.txt | awk -F'|' '$3 !~ /^(PASS|FAIL|WARN|INFO|NA)$/' | head -5)
           [ -z "$bad" ] || { echo "bad verdicts:"; echo "$bad"; exit 1; }
+      - name: No duplicate check IDs on a real host
+        run: |
+          dupes=$(grep '^CHECK|' live.txt | cut -d'|' -f2 | sort | uniq -d | head -5)
+          [ -z "$dupes" ] || { echo "duplicate ids:"; echo "$dupes"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -95,3 +108,29 @@ jobs:
           path: |
             live.txt
             live.err
+
+  # The collector's container handling only exists to be run in a container, so run it in one.
+  container-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit a stock image and assert host controls are not reported as image defects
+        run: |
+          S=plugins/linux-security-audit/skills/linux-security-audit/scripts/lsa-collect.sh
+          docker run --rm -i --entrypoint bash --network none debian:stable-slim -s -- --passive < "$S" > ctr.txt 2>/dev/null || true
+          grep -q '^CHECK|container.context' ctr.txt || { echo "container not detected"; exit 1; }
+          echo "--- non-PASS lines ---"; grep '^CHECK|' ctr.txt | grep -vE '\|(PASS|NA|INFO)\|' || true
+          # host-owned controls must be NA in a container, never a finding against the image
+          for id in firewall.active integrity.fim time.synced session.tmout cron.allow; do
+            v=$(grep "^CHECK|$id|" ctr.txt | cut -d'|' -f3)
+            [ -z "$v" ] && continue
+            [ "$v" = "NA" ] || { echo "$id reported '$v' in a container; must be NA"; exit 1; }
+          done
+          n=$(grep '^CHECK|' ctr.txt | grep -cvE '\|(PASS|NA|INFO)\|')
+          echo "non-PASS findings on a stock debian image: $n"
+          [ "$n" -lt 20 ] || { echo "container profile is not suppressing host controls"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-collection
+          path: ctr.txt

@@ -46,11 +46,25 @@ reason not to.
    into anything the user did not explicitly point you at. Production hosts especially.
 3. **No exploitation.** This is a configuration audit. Do not attempt privilege escalation,
    password cracking, or exploiting anything found.
-4. **Know the execution context.** The collector detects whether it is running in a container and
-   reports every host-owned section (`BOOT`, `KERNEL_MODULES`, `DISK_ENCRYPTION`, `USB`, `DRIFT`,
-   and all non-namespaced sysctls) as `NA` rather than describing the host and calling it the
-   container. Inside a container only `net.*` and the IPC sysctls are namespaced; everything else
-   belongs to the host and must be audited there.
+4. **Know the execution context.** In a container the collector reports host-owned controls as
+   `NA` with the reason, rather than describing the host and calling it the container. That covers
+   `BOOT`, `KERNEL_MODULES`, `DISK_ENCRYPTION`, `USB` and `DRIFT`, and also the controls a container
+   cannot implement at all: mount layout, firewall, time sync, file-integrity monitoring, core dump
+   handling, and the interactive-login family (`TMOUT`, banners, password ageing, `cron.allow`).
+   Measured on three production images, those alone were 49 of 55 non-`PASS` lines, which buried
+   the three that were actionable.
+
+   It further distinguishes **two kinds of container**, reported in `container.context`:
+
+   - **workload** — PID 1 is the application. This is a deployed container, so its seccomp profile,
+     `no_new_privs`, rootfs mode and namespaced sysctls are real findings about the deployment.
+   - **inspection** — PID 1 is a shell, so the container exists only to read an image (`docker run
+     -i <image> bash -s < collector`). Runtime posture here belongs to *your* `docker run`, not to
+     the image, so it reports `NA`. What survives is genuinely image-level: `USER`, SUID binaries,
+     baked `ENV` secrets, repo trust, package surface.
+
+   When auditing an image, report the image-level findings and say explicitly that runtime posture
+   was not assessed and must be read from the compose/swarm/k8s manifest instead.
 5. **Never lock the user out.** Firewall, SSH, PAM, `noexec`, GRUB-password and `module.sig_enforce`
    changes can end a session or brick a boot. Every proposed change carries a rollback and a
    "test before you commit" step. See `references/remediation.md` → *Lockout-risk changes*.

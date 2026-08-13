@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
-LSA_VERSION="1.4.1"
+LSA_VERSION="1.5.0"
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -171,8 +171,58 @@ fi
 [ -n "$LSA_TALLY" ] && trap 'rm -f "$LSA_TALLY"' EXIT HUP INT TERM
 LSA_SECT=""; LSA_SECT_T0="$LSA_T0"
 
+# ---------------- container profile ----------------
+# A container image cannot implement a host control, and reporting one as a defect buries the
+# findings that ARE actionable. Measured on three production images: 49 of 55 non-PASS lines were
+# host controls, leaving 3 real ones. These become NA with the reason, never silent suppression.
+ctr_host_owned() {
+  case "$1" in
+    mount/*|mount.*)
+      CTR_WHY="the image is a single layered filesystem; separate mounts and their nosuid/noexec/nodev options are set by the host or the orchestrator (tmpfs mounts, volume options, --mount), not in the image" ;;
+    firewall.*)
+      CTR_WHY="a container has no netfilter of its own; ingress and egress filtering belong to the host, the orchestrator network policy, or the cloud security group" ;;
+    time.*)
+      CTR_WHY="the clock is the host kernel's; NTP configuration inside an image has no effect and no ntpd runs here" ;;
+    integrity.fim)
+      CTR_WHY="file-integrity monitoring is the wrong control for an immutable image: drift is prevented by rebuilding and by a read-only rootfs, not detected after the fact" ;;
+    session.tmout|banner.*|users.password_reuse|users.inactive_lock|users.single_user_auth|cron.allow)
+      CTR_WHY="an interactive-login control; this container has no console, no getty and no sshd, so there is no login session for it to govern" ;;
+    coredump.limits)
+      CTR_WHY="core dump handling is kernel-wide and set on the host; a container cannot change it" ;;
+    proc.hidepid)
+      CTR_WHY="/proc is mounted into the container by the runtime; hidepid is set with a --mount option or the pod spec, not from inside the image" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+# Properties of how THIS container was started, not of the image. When the collector is the
+# workload (an inspection container), they describe the throwaway container it is running in.
+ctr_runtime_posture() {
+  case "$1" in
+    container.privileged|container.seccomp|container.mac|container.no_new_privs|\
+    container.readonly_rootfs|container.socket.*|container.host_mount*|container.host_sensitive_mount)
+      return 0 ;;
+    sysctl.net.*|sysctl.kernel.*|sysctl.vm.*|sysctl.fs.*|sysctl.dev.*) return 0 ;;
+    umask.effective) return 0 ;;
+  esac
+  return 1
+}
+
 chk()  {
   _cid="$1"; _cst="$2"; _cob="$3"; _cnt="$4"; _cm="${5:-$METHOD}"
+  if [ -n "${CTR:-}" ] && ctr_host_owned "$_cid"; then
+    _cst=NA; _cob="container: control belongs to the host"; _cnt="$CTR_WHY"
+  elif [ -n "${CTR:-}" ] && [ "${CTR_MODE:-}" = "inspection" ] && ctr_runtime_posture "$_cid"; then
+    # PID 1 is a shell, so this container was started to inspect an image. Its seccomp profile,
+    # rootfs mode and netns sysctls are this throwaway container's, and say nothing about how the
+    # image is deployed. Reporting them as image findings is describing the wrong thing.
+    _cst=NA; _cob="inspection container: reflects this run, not the image"
+    _cnt="started to inspect the image, so runtime posture and namespaced sysctls here are docker's defaults for this command. Audit the deployed service (compose/swarm/k8s manifest) for these"
+  elif [ -n "${CTR:-}" ] && [ "${CTR_MODE:-}" = "workload" ] && ctr_runtime_posture "$_cid"; then
+    case "$_cid" in
+      sysctl.*) _cnt="${_cnt} [container: namespaced sysctls cannot be set from the image; fix with --sysctl, a sysctls: block in the pod spec, or on the host]" ;;
+    esac
+  fi
   if [ "$OFFLINE" = "1" ]; then
     case "$_cm" in
       runtime*|active*)
@@ -345,6 +395,17 @@ fi
 [ -z "$CTR" ] && [ -r /proc/1/comm ] && case "$(cat /proc/1/comm 2>/dev/null)" in
   systemd|init|openrc-init|runit) ;; *) [ -d /proc/1 ] && CTR=1 && CTRTYPE="${CTRTYPE:-pid1-not-init}" ;;
 esac
+# Which kind of container: a deployed workload, or one started just to inspect an image?
+# PID 1 tells us. A workload's PID 1 is the application; an inspection container's is the shell
+# the collector was piped into. The distinction decides whether runtime posture is a finding.
+CTR_MODE=""
+if [ -n "$CTR" ]; then
+  CTR_MODE=workload
+  case "$(cat /proc/1/comm 2>/dev/null)" in
+    sh|bash|dash|ash|zsh|ksh|busybox|lsa-collect.sh) CTR_MODE=inspection ;;
+  esac
+fi
+
 host_owned() { # true when a host-level check cannot describe this execution context
   [ -n "$CTR" ]
 }
@@ -3437,7 +3498,7 @@ if [ "$PKGV_RUN" = "yes" ]; then
     chk integrity.pkgverify_binaries PASS "no packaged binary or library diverges from its package" ""
   fi
   [ "${PKGV_CFG:-0}" -gt 0 ] && chk integrity.pkgverify_configs INFO "${PKGV_CFG} modified config file(s)" "expected on any administered host — these are conffiles the admin edited. Worth skimming for anything nobody remembers changing"
-  [ "${PKGV_MISS:-0}" -gt 0 ] && chk integrity.pkgverify_missing WARN "${PKGV_MISS} packaged file(s) missing from disk" "a file the package installed is gone: a broken upgrade, a manual deletion, or an attacker removing something that got in the way (a log, an auditd rule, a binary they replaced with a different path)"
+  [ "${PKGV_MISS:-0}" -gt 0 ] && chk integrity.pkgverify_missing "$([ -n "${CTR:-}" ] && echo INFO || echo WARN)" "${PKGV_MISS} packaged file(s) missing from disk" "a file the package installed is gone: a broken upgrade, a manual deletion, or an attacker removing something that got in the way (a log, an auditd rule, a binary they replaced with a different path)"
   chk integrity.pkgverify_trust INFO "verification uses the local package database" "an attacker with root can rewrite the recorded checksums, so a clean result proves the absence of opportunistic tampering, not the absence of a competent intruder. An off-host AIDE database, dm-verity, or comparing against freshly downloaded packages is what closes that gap"
 fi
 
@@ -5039,7 +5100,7 @@ sec CONTAINER
 if [ -z "$CTR" ]; then
   chk container.context INFO "not running inside a container" "host-level audit; container-image checks skipped"
 else
-  chk container.context INFO "$CTRTYPE" "container-level checks below; every host-owned section reports NA"
+  chk container.context INFO "$CTRTYPE (${CTR_MODE:-unknown} mode)" "container-level checks below; host-owned controls report NA with the reason. In inspection mode (PID 1 is a shell, so this container exists only to read the image) the runtime posture and namespaced sysctls describe THIS run, not the deployment, and report NA too: audit the compose/swarm/k8s manifest for those"
 
   # --- identity: the single highest-value container control ---
   CUID="$(id -u)"

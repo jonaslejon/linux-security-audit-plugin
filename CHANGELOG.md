@@ -9,6 +9,37 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.5.0] — 2026-08-13
+
+Container reports were mostly noise. Auditing three production images produced 55 non-`PASS` lines
+each, of which 49 were host controls a container cannot implement and 3 were actionable.
+
+### Added
+
+- **A container profile.** Controls that belong to the host or the orchestrator now report `NA`
+  with the reason instead of as findings against the image: mount layout, firewall, time sync,
+  file-integrity monitoring, core dump handling, `/proc` hidepid, and the interactive-login family
+  (`TMOUT`, banners, password reuse and ageing, single-user auth, `cron.allow`). They are stated,
+  not suppressed, because a container audit that silently drops a control is the same failure as
+  one that invents a finding. Same images now: 6 to 8 non-`PASS` lines, all image-level.
+- **Image audits are distinguished from running-container audits.** PID 1 decides: a workload's is
+  the application, an inspection container's is the shell the collector was piped into. In
+  inspection mode, seccomp, `no_new_privs`, rootfs mode, AppArmor and namespaced sysctls describe
+  the throwaway container the collector is running in, not the image, so they report `NA` pointing
+  at the deployment manifest. In workload mode they are reported, with sysctl notes rerouted to
+  `--sysctl` and the pod spec since an image cannot set them. `container.context` names the mode.
+- **`tests/check-registry.sh` and a CI job for it.** A check that emits nothing is indistinguishable
+  from one that passed, which is the single failure the output format cannot express, and it is
+  easy to introduce: a check guarded by `[ -n "$X" ] && chk ...` vanishes when `X` is empty and
+  nothing says so. The emitted ID set from a deterministic offline run is now pinned, and CI fails
+  if any check stops emitting or if two checks share an ID. Verified by deliberately breaking a
+  check and confirming the test catches it.
+- **A CI job that audits a stock `debian:stable-slim` image**, asserting host controls come back
+  `NA` in a container and that the total finding count stays in single digits. The container
+  handling only exists to run in a container, so CI runs it in one.
+- **`integrity.pkgverify_missing` is `INFO` in a container**, where missing packaged files are
+  deliberate slimming rather than drift.
+
 ## [1.4.1] — 2026-08-13
 
 Three false positives found by running the collector against real Docker images.
