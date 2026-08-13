@@ -1747,9 +1747,9 @@ chk web.present INFO "${WS:-none detected}" ""
 
 if [ -n "$WS" ]; then
   raw "web server versions (EOL/unpatched versions are the finding)"
-  have nginx   && run nginx -v
+  [ "$OFFLINE" = "0" ] && have nginx   && run nginx -v
   have apache2 && run apache2 -v
-  have httpd   && run httpd -v
+  [ "$OFFLINE" = "0" ] && have httpd   && run httpd -v
   have caddy   && run caddy version
   have haproxy && run haproxy -v 2>&1 | head -2
 
@@ -1842,11 +1842,11 @@ if [ -n "$WS" ]; then
 fi
 
 # ---- nginx ----
-if [ -d "$(rf /etc/nginx)" ] || have nginx; then
+if [ -d "$(rf /etc/nginx)" ] || have_target nginx; then
   raw "nginx config test"
-  have nginx && run nginx -t
+  [ "$OFFLINE" = "0" ] && have nginx && run nginx -t
   raw "nginx effective config (nginx -T)"
-  if [ "$AM_ROOT" = "1" ] && have nginx; then NGX="$(nginx -T 2>/dev/null)"; else NGX="$(grep -rhvE '^\s*#|^\s*$' "$(rf /etc/nginx/)" 2>/dev/null)"; fi
+  if [ "$OFFLINE" = "0" ] && [ "$AM_ROOT" = "1" ] && have nginx; then NGX="$(nginx -T 2>/dev/null)"; else NGX="$(grep -rhvE '^\s*#|^\s*$' "$(rf /etc/nginx/)" 2>/dev/null)"; fi
   printf '%s\n' "$NGX" | grep -vE '^\s*#' | grep -vE '^\s*$' | cap 400
 
   ngx_has() { printf '%s' "$NGX" | grep -qiE "$1"; }
@@ -1882,7 +1882,7 @@ if [ -d "$(rf /etc/nginx)" ] || have nginx; then
   # ---- nginx modules: dynamically loaded and compiled-in, vs actually used ----
   raw "nginx dynamic modules (load_module) and build-time modules (nginx -V)"
   printf '%s\n' "$NGX" | grep -iE '^\s*load_module' | sort -u
-  have nginx && run nginx -V 2>&1 | tr ' ' '\n' | grep -E '^--(with|add)' | sort
+  [ "$OFFLINE" = "0" ] && have nginx && run nginx -V 2>&1 | tr ' ' '\n' | grep -E '^--(with|add)' | sort
   NGV="$(nginx -V 2>&1 | tr ' ' '\n' | grep -E '^--(with|add)' | tr '\n' ' ')"
   NGLOAD="$(printf '%s\n' "$NGX" | grep -iE '^\s*load_module' | grep -oE '[A-Za-z0-9_]+_module' | sort -u | tr '\n' ' ')"
 
@@ -1933,9 +1933,13 @@ stream~--with-stream ngx_stream_module~^[[:space:]]*stream[[:space:]]*\\{~generi
 fi
 
 # ---- apache ----
+# Offline the installed binary belongs to the AUDITING host: `apachectl -D DUMP_MODULES` would
+# dump the auditor's loaded modules and attribute them to the image. Config is read from the tree.
 APACHECTL=""
-have apache2ctl && APACHECTL=apache2ctl
-have apachectl && [ -z "$APACHECTL" ] && APACHECTL=apachectl
+if [ "$OFFLINE" = "0" ]; then
+  have apache2ctl && APACHECTL=apache2ctl
+  have apachectl && [ -z "$APACHECTL" ] && APACHECTL=apachectl
+fi
 if [ -n "$APACHECTL" ] || [ -d "$(rf /etc/apache2)" ] || [ -d "$(rf /etc/httpd)" ]; then
   raw "apache config test + vhost map"
   [ -n "$APACHECTL" ] && { run $APACHECTL -t; run $APACHECTL -S; }

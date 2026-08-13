@@ -37,6 +37,13 @@ each, of which 49 were host controls a container cannot implement and 3 were act
 - **A CI job that audits a stock `debian:stable-slim` image**, asserting host controls come back
   `NA` in a container and that the total finding count stays in single digits. The container
   handling only exists to run in a container, so CI runs it in one.
+- **Web server detection no longer runs the auditing host's binaries offline.** `have nginx` and
+  `have apachectl` resolve against the auditor's `PATH`, so under `--root` the collector invoked
+  `nginx -T` and `apachectl -D DUMP_MODULES` and attributed the auditor's config and loaded modules
+  to the image. Found by the new check-registry job, which failed because the macOS baseline
+  contained `apache.unused_mod.*` entries that could only have come from the auditing machine.
+  Verified with nginx installed on the auditing host: a tree without one now yields four correct
+  `NA`s and zero references to the host's config.
 - **`integrity.pkgverify_missing` is `INFO` in a container**, where missing packaged files are
   deliberate slimming rather than drift.
 

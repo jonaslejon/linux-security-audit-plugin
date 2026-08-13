@@ -17,6 +17,16 @@ BASELINE="${SELF_DIR}/fixtures/offline-check-ids.txt"
 UPDATE=0
 [ "${1:-}" = "--update" ] && UPDATE=1
 
+# The ID universe is platform-dependent: which checks exist at all depends on the auditing
+# platform's userland. This tool supports Linux, so the baseline is a Linux baseline, and running
+# it anywhere else would compare against a fixture that was never meant to describe that platform.
+if [ "$(uname -s)" != "Linux" ]; then
+  printf 'check registry: SKIP (baseline is Linux-only; this is %s)\n' "$(uname -s)"
+  printf '  run it in a container:\n'
+  printf '    docker run --rm -v "$PWD:/repo" -w /repo debian:stable-slim bash tests/check-registry.sh\n'
+  exit 0
+fi
+
 FIXTURE="$(mktemp -d)"
 OUT="$(mktemp)"
 trap 'rm -rf "$FIXTURE" "$OUT"' EXIT
