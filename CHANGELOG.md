@@ -91,6 +91,13 @@ Everything here was reported by Patrik Solsten, who cloned the repo and actually
   from a Debian host checksummed the auditor's own packages under a 600-second timeout. That is
   both a wrong answer and what made an offline run appear to hang. Now uses the image's database,
   or reports `NA` when the tree has none.
+- **Five further checks described the auditing host offline**, none of them reachable from a
+  macOS development box because it has none of the files involved: `users.missing_groups` resolved
+  GIDs through the auditor's NSS, `logperm.auth.log`/`logperm.btmp` read the auditor's `/var/log`,
+  `packages.orphaned` compared the auditor's package database against the auditor's repository
+  metadata, and `integrity.kernel_enforced` reported the auditor's IMA/dm-verity state. The first
+  three now read the mounted tree; the last two are `NA` offline, since `apt-cache` and
+  `/sys/kernel/security` have no offline equivalent at all.
 - **`tr '_' '[_-]'` was not doing anything.** `tr` maps characters, not strings, so the USB module
   blacklist check turned `_` into `[` and GNU `tr` rejected the reversed range outright, printing
   an error per module. It never matched a `-` separated module name. Now a `sed` character class.

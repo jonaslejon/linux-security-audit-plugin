@@ -990,9 +990,16 @@ DUPGN="$(awk -F: '/^[^#]/ && NF>=3 && $1!="" {print $1}' "$(rf /etc/group)" 2>/d
 # groups referenced in passwd that do not exist in group
 # only meaningful where /etc/group is actually the group source (not LDAP/Open Directory);
 # if GID 0 does not resolve, getent is not backed by the local files and the result is noise
-if getent group 0 >/dev/null 2>&1; then
+if [ "$OFFLINE" = "1" ] && ! readable "$(rf /etc/group)"; then
+  chk users.missing_groups NA "no /etc/group in the mounted tree" "primary GIDs cannot be resolved against the image; the auditing host's group database would answer for the wrong machine"
+elif [ "$OFFLINE" = "1" ] || getent group 0 >/dev/null 2>&1; then
+  # Offline the group database must come out of the tree. getent consults the AUDITOR's NSS.
   MISSG="$(awk -F: '/^[^#]/ && NF>=7 && $4 ~ /^[0-9]+$/ {print $4}' "$(rf /etc/passwd)" 2>/dev/null | sort -u | while read -r g; do
-    getent group "$g" >/dev/null 2>&1 || printf '%s ' "$g"; done)"
+    if [ "$OFFLINE" = "1" ]; then
+      awk -F: -v g="$g" '$3==g{f=1} END{exit !f}' "$(rf /etc/group)" 2>/dev/null || printf '%s ' "$g"
+    else
+      getent group "$g" >/dev/null 2>&1 || printf '%s ' "$g"
+    fi; done)"
   [ -n "$MISSG" ] && chk users.missing_groups WARN "$MISSG" "primary GIDs referenced in /etc/passwd with no matching group" \
                   || chk users.missing_groups PASS "all primary GIDs resolve" ""
 else
@@ -2827,11 +2834,15 @@ fi
 
 # --- packages NOT provided by any configured repository: these never get security updates ---
 raw "packages with no candidate in any configured repository (orphaned / locally installed)"
-if have apt-cache && have dpkg-query; then
+# apt-cache has no offline mode: it answers from the auditing host's lists no matter what
+# --admindir the query used, so the whole comparison is meaningless against a mounted image.
+if [ "$OFFLINE" = "1" ]; then
+  chk packages.orphaned NA "repository candidates are not determinable offline" "apt-cache/dnf answer from the auditing host's repository metadata, not the image's; check this on the booted instance"
+elif have apt-cache && have dpkg-query; then
   # One apt-cache call per package meant up to 800 forks here, unbounded and not covered by
   # --quick, which is enough to make the whole run look like it has hung. apt-cache policy takes
   # a package list, so xargs turns that into one or two invocations.
-  ORPH="$(dpkg-query -f '${binary:Package}\n' -W 2>/dev/null | head -800 \
+  ORPH="$(dpkg-query ${DPKGOPT:-} -f '${binary:Package}\n' -W 2>/dev/null | head -800 \
           | tmo 120 xargs -r apt-cache policy 2>/dev/null \
           | awk '/^[^[:space:]][^:]*:$/ { pk=substr($0,1,length($0)-1) }
                  /Candidate:/ { if ($2=="(none)") printf "%s ", pk }')"
@@ -2844,7 +2855,7 @@ if have apt-cache && have dpkg-query; then
   apt-mark showhold 2>/dev/null | cap 10
   HELD="$(apt-mark showhold 2>/dev/null | wc -l | tr -d ' ')"
   [ "${HELD:-0}" -gt 0 ] && chk packages.held WARN "${HELD} package(s) on hold" "held packages are excluded from security updates — confirm each hold is still justified"
-elif have dnf; then
+elif have dnf && [ "$OFFLINE" = "0" ]; then
   raw "packages not in any repository (dnf repoquery --extras)"
   # Run once and reuse: the second, unbounded call doubled the cost of the slowest query in
   # this section on a host with a large repo set.
@@ -3277,7 +3288,8 @@ else
 fi
 
 # the sensitive ones specifically — these must never be world-readable
-for L in /var/log/auth.log /var/log/secure /var/log/sudo.log /var/log/audit/audit.log /var/log/btmp; do
+for L in "$LSA_ROOT"/var/log/auth.log "$LSA_ROOT"/var/log/secure "$LSA_ROOT"/var/log/sudo.log \
+        "$LSA_ROOT"/var/log/audit/audit.log "$LSA_ROOT"/var/log/btmp; do
   [ -e "$L" ] || continue
   M="$(stat -c '%a' "$L" 2>/dev/null)"; O="$(stat -c '%U:%G' "$L" 2>/dev/null)"
   case "$M" in
@@ -3352,6 +3364,7 @@ raw "IMA / EVM / dm-verity / dm-integrity"
 [ -e /sys/kernel/security/evm ] && printf 'EVM=%s\n' "$(cat /sys/kernel/security/evm 2>/dev/null)"
 case " $(cat /proc/cmdline 2>/dev/null) " in *" ima_appraise="*|*" ima_policy="*) echo "IMA configured on the kernel cmdline" ;; esac
 have dmsetup && dmsetup targets 2>/dev/null | grep -E 'verity|integrity'
+runtime_on   # /sys/kernel/security and dmsetup describe the RUNNING kernel, never a mounted image
 if [ -d /sys/kernel/security/ima ] || dmsetup targets 2>/dev/null | grep -q verity; then
   chk integrity.kernel_enforced PASS "IMA/dm-verity present" "measurement or verification happens in the kernel, not on a schedule"
 else
