@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
-LSA_VERSION="1.5.1"
+LSA_VERSION="1.5.2"
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -298,10 +298,15 @@ sec() {
   METHOD="$SECTION_DEFAULT"
 }
 # tmo <secs> CMD... — bounded execution even where GNU `timeout` is absent
+# stderr is NOT merged into stdout. It used to be, and that turned every diagnostic into data:
+# `dnf repoquery --extras` with no network printed "Error: Failed to download metadata..." to
+# stderr, which arrived on stdout, was counted as one line, and became
+# "packages.orphaned FAIL: 1 package(s) not provided by any repo" on an image that had none.
+# Call sites that want the diagnostic in the report add 2>&1 themselves.
 tmo() {
   _s="$1"; shift
-  if have timeout; then timeout "$_s" "$@" 2>&1; return; fi
-  "$@" 2>&1 & _p=$!
+  if have timeout; then timeout "$_s" "$@"; return; fi
+  "$@" & _p=$!
   ( sleep "$_s"; kill -9 "$_p" 2>/dev/null ) >/dev/null 2>&1 & _w=$!
   wait "$_p" 2>/dev/null; _r=$?
   kill -9 "$_w" >/dev/null 2>&1
@@ -1762,7 +1767,7 @@ chk web.present INFO "${WS:-none detected}" ""
 
 if [ -n "$WS" ]; then
   raw "web server versions (EOL/unpatched versions are the finding)"
-  [ "$OFFLINE" = "0" ] && have nginx   && run nginx -v
+  [ "$OFFLINE" = "0" ] && have nginx   && run nginx -v 2>&1
   have apache2 && run apache2 -v
   [ "$OFFLINE" = "0" ] && have httpd   && run httpd -v
   have caddy   && run caddy version
@@ -1859,7 +1864,7 @@ fi
 # ---- nginx ----
 if [ -d "$(rf /etc/nginx)" ] || have_target nginx; then
   raw "nginx config test"
-  [ "$OFFLINE" = "0" ] && have nginx && run nginx -t
+  [ "$OFFLINE" = "0" ] && have nginx && run nginx -t 2>&1
   raw "nginx effective config (nginx -T)"
   if [ "$OFFLINE" = "0" ] && [ "$AM_ROOT" = "1" ] && have nginx; then NGX="$(nginx -T 2>/dev/null)"; else NGX="$(grep -rhvE '^\s*#|^\s*$' "$(rf /etc/nginx/)" 2>/dev/null)"; fi
   printf '%s\n' "$NGX" | grep -vE '^\s*#' | grep -vE '^\s*$' | cap 400
@@ -1957,7 +1962,7 @@ if [ "$OFFLINE" = "0" ]; then
 fi
 if [ -n "$APACHECTL" ] || [ -d "$(rf /etc/apache2)" ] || [ -d "$(rf /etc/httpd)" ]; then
   raw "apache config test + vhost map"
-  [ -n "$APACHECTL" ] && { run $APACHECTL -t; run $APACHECTL -S; }
+  [ -n "$APACHECTL" ] && { run $APACHECTL -t 2>&1; run $APACHECTL -S 2>&1; }
   raw "apache loaded modules"
   [ -n "$APACHECTL" ] && run $APACHECTL -M 2>/dev/null | sort
   APM="$([ -n "$APACHECTL" ] && $APACHECTL -M 2>/dev/null)"
@@ -2095,7 +2100,13 @@ WWWUSER="${WEBUSER:-}"
 case "$WWWUSER" in
   root) chk web.worker_identity FAIL "worker runs as root" "every path in the document root is writable by the request-handling process by definition; the writable-webroot analysis below is meaningless until the worker drops privileges"
         WWWUSER="" ;;
-  "")   chk web.worker_identity WARN "worker user not determined" "no running worker and no standard account found; writability is evaluated for world-writable only" ;;
+  # No web server on the target at all: there is no worker to identify, and warning about one
+  # invents a subject. UBI ships neither nginx nor httpd and still got this warning.
+  "")   if [ -z "${WS//[[:space:]]/}" ] && [ -z "${DOCROOTS//[[:space:]]/}" ]; then
+          chk web.worker_identity NA "no web server on this target" "no nginx/apache/httpd binary, configuration directory or document root was found, so there is no request-handling identity to evaluate"
+        else
+        chk web.worker_identity WARN "worker user not determined" "no running worker and no standard account found; writability is evaluated for world-writable only"
+        fi ;;
   *)    chk web.worker_identity INFO "user=$WWWUSER groups=$(id -nG "$WWWUSER" 2>/dev/null)" "writability below is evaluated against this identity, by all three routes: owner, group, and other" ;;
 esac
 WWWGROUPS="$(id -nG "$WWWUSER" 2>/dev/null)"
@@ -2943,10 +2954,17 @@ elif have dnf && [ "$OFFLINE" = "0" ]; then
   raw "packages not in any repository (dnf repoquery --extras)"
   # Run once and reuse: the second, unbounded call doubled the cost of the slowest query in
   # this section on a host with a large repo set.
-  DNFX="$(run dnf -q repoquery --extras 2>/dev/null)"
+  DNFX="$(run dnf -q repoquery --extras 2>/dev/null)"; DNFRC=$?
   printf '%s\n' "$DNFX" | cap 20
   EXTRA="$(printf '%s\n' "$DNFX" | grep -c .)"
+  if [ "$DNFRC" != "0" ]; then
+    # No network, no subscription, or a broken repo config. Whatever the reason, the question
+    # "is any installed package absent from every repository" was not answered.
+    chk packages.orphaned NA "dnf repoquery failed (rc=$DNFRC)" "the repositories could not be queried, so orphaned packages are not determinable. Common inside a container run without network, or on an unsubscribed RHEL host"
+    EXTRA=-1
+  fi
   [ "${EXTRA:-0}" -gt 0 ] && chk packages.orphaned FAIL "${EXTRA} package(s) not provided by any repo" "no security updates reach these"
+  [ "${EXTRA:-0}" = "0" ] && chk packages.orphaned PASS "every installed package is provided by a repository" ""
 fi
 
 # --- removed-but-not-purged (Debian): config, and sometimes data, left behind ---

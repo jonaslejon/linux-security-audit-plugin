@@ -9,6 +9,29 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.5.2] — 2026-08-13
+
+The two UBI findings that were flagged as suspect rather than reported. One was a symptom of a
+defect affecting every command the collector runs under a timeout.
+
+### Fixed
+
+- **`tmo` merged stderr into stdout, so diagnostics were counted as data.** `dnf repoquery
+  --extras` with no network wrote "Error: Failed to download metadata for repo..." to stderr, which
+  arrived on stdout, counted as one line, and became `packages.orphaned FAIL: 1 package(s) not
+  provided by any repo` on an image that had none. The same path poisoned `dpkg --verify`,
+  `rpm -Va`, `debsums -l`, `apk audit` and the cron file scan, all of which count or parse captured
+  output. `tmo` no longer merges; the handful of display sites whose evidence genuinely is the
+  stderr stream (`nginx -t`, `nginx -v`, `apachectl -t/-S`) now say `2>&1` explicitly, verified by
+  confirming their output still reaches the report on a host with nginx installed.
+- **A failed `dnf repoquery` is `NA`, not a finding.** No network, no subscription or a broken repo
+  config all mean the question "is any installed package absent from every repository" went
+  unanswered. It also now emits `PASS` when the query succeeds and finds nothing, instead of
+  staying silent.
+- **`web.worker_identity` warned about the web server on images that have none.** UBI ships neither
+  nginx nor httpd and still got "worker user not determined". Now `NA` when no web server binary,
+  configuration directory or document root exists; unchanged when one does.
+
 ## [1.5.1] — 2026-08-13
 
 Six issues found by auditing the official Red Hat UBI 9 image, the first RPM-based target. All
