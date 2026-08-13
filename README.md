@@ -62,7 +62,7 @@ beyond a POSIX shell and the tools it audits:
 
 ```bash
 # the plugin install path varies; locate the collector rather than guessing
-S="$(find "$HOME/.claude" -name lsa-collect.sh -path '*linux-security-audit*' 2>/dev/null | head -1)"
+S="$(find -L "$HOME/.claude" -name lsa-collect.sh -path '*linux-security-audit*' 2>/dev/null | head -1)"
 
 # a live host, over SSH, leaving nothing behind on the target
 ssh -p 22 user@host 'sudo bash -s' < "$S" > report.txt

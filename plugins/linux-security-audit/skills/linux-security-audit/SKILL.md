@@ -75,7 +75,8 @@ Locate the collector rather than assuming a path: it moves depending on whether 
 installed as a plugin, cloned as a marketplace, or dropped into `~/.claude/skills`.
 
 ```bash
-SK="$(find "${CLAUDE_PLUGIN_ROOT:-$HOME/.claude}" "$HOME/.claude/plugins" "$HOME/.claude/skills" \
+# -L follows symlinks: a skill installed by symlinking into ~/.claude/skills is invisible without it
+SK="$(find -L "${CLAUDE_PLUGIN_ROOT:-$HOME/.claude}" "$HOME/.claude/plugins" "$HOME/.claude/skills" \
         -name lsa-collect.sh -path '*linux-security-audit*' 2>/dev/null | head -1)"
 [ -n "$SK" ] || echo 'collector not found — check the plugin is installed'
 

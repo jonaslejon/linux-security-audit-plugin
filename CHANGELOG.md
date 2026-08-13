@@ -26,6 +26,9 @@ Three false positives found by running the collector against real Docker images.
   Node base images set `GPG_KEY` to the OpenPGP fingerprint used to verify the source tarball, and
   `*_SHA256` to a published digest. Both are public by design. Matching on the variable name alone
   reported them as leaked secrets; bare hex fingerprints and digests are now excluded on value shape.
+- **The documented way to locate the collector could not find it.** `find` does not traverse
+  symlinks, so a skill installed by symlinking into `~/.claude/skills`, which is how you develop
+  one, resolved to an empty path in `SKILL.md` and both READMEs. Now `find -L`.
 - **`packages.auto_updates` recommended unattended-upgrades inside container images.** The image is
   immutable and the container is replaced on the next deploy, so in-place patching is the wrong
   control: it belongs to the rebuild pipeline. Now `NA` in a container context with that reasoning.
