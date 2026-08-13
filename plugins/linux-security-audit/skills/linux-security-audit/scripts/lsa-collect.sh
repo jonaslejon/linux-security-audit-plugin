@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
-LSA_VERSION="1.5.0"
+LSA_VERSION="1.5.1"
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -189,6 +189,12 @@ ctr_host_owned() {
       CTR_WHY="an interactive-login control; this container has no console, no getty and no sshd, so there is no login session for it to govern" ;;
     coredump.limits)
       CTR_WHY="core dump handling is kernel-wide and set on the host; a container cannot change it" ;;
+    logging.auditd|logging.auditd_rules|logging.auditd_coverage|logret.auditd*)
+      CTR_WHY="the kernel audit subsystem is not namespaced and a container cannot run auditd meaningfully; audit the host, and collect container events there" ;;
+    logging.remote|logging.*_forward|logret.journal*|logging.journal*)
+      CTR_WHY="a container writes to stdout/stderr and the runtime log driver ships it; journald retention and remote forwarding are configured on the host or in the logging sidecar" ;;
+    misc.running_newest|kernel.*)
+      CTR_WHY="the kernel is the host's; a container has no kernel of its own to update" ;;
     proc.hidepid)
       CTR_WHY="/proc is mounted into the container by the runtime; hidepid is set with a --mount option or the pod spec, not from inside the image" ;;
     *) return 1 ;;
@@ -903,8 +909,16 @@ if [ -z "$ROOTMODE" ]; then
 else
   OTH="$(printf '%s' "$ROOTMODE" | sed 's/.*\(.\)/\1/')"
   GRP="$(printf '%s' "$ROOTMODE" | sed 's/.*\(.\)./\1/')"
+  ROOTGRP="$(stat -L -c '%G' "$(rf /root)" 2>/dev/null)"
   case "$ROOTMODE" in
-    700|0700) chk perm./root PASS "$ROOTMODE" "" ;;
+    # Anything with no world bits and a root-owned group exposes nothing. Red Hat ships 0550,
+    # which is stricter than 0700 for group and other, and failing it was simply wrong.
+    700|0700|750|0750|500|0500|550|0550|000|0|00|400|0400|600|0600)
+      if [ "$OTH" = "0" ] && { [ -z "$ROOTGRP" ] || [ "$ROOTGRP" = "root" ]; }; then
+        chk perm./root PASS "$ROOTMODE" ""
+      else
+        chk perm./root WARN "$ROOTMODE (group $ROOTGRP)" "no world access, but a non-root group can read root's files"
+      fi ;;
     *) if [ "$OTH" != "0" ]; then
          chk perm./root FAIL "$ROOTMODE" "/root must be 0700. Other local users can list or read it — root's shell history, .ssh, kubeconfigs, cloud credentials and anything left there during maintenance"
        else
@@ -1006,7 +1020,8 @@ case "$SH" in
       else
         chk perm./etc/shadow NA "/etc/shadow not present" "no shadow file in this tree; on a live host this would itself be a finding, offline it usually means the image stores accounts elsewhere"
       fi ;;
-  "640 root shadow"|"600 root root"|"000 root root"|"640 root root") chk perm./etc/shadow PASS "$SH" "" ;;
+  "640 root shadow"|"600 root root"|"640 root root"|"400 root root"|\
+  "0 root root"|"00 root root"|"000 root root") chk perm./etc/shadow PASS "$SH" "" ;;
   *) chk perm./etc/shadow FAIL "$SH" "want 640 root:shadow or stricter" ;;
 esac
 raw "umask configuration"
@@ -4584,7 +4599,11 @@ SECRET_PEM='-----BEGIN ((RSA|DSA|EC|OPENSSH|PGP|ENCRYPTED|ENCRYPTED PRIVATE|SSH2
 # an assignment line whose KEY matches SECRET_KEYS. Optional surrounding quotes are matched
 # with [^A-Za-z0-9]{0,2} rather than a class containing " and ', which does not survive the
 # nested command substitutions this pattern is used inside.
-SECRET_ASSIGN_RE="^[[:space:]]*(export[[:space:]]+)?[^A-Za-z0-9]{0,2}[A-Za-z0-9_.-]*${SECRET_KEYS}[A-Za-z0-9_]{0,8}[^A-Za-z0-9]{0,2}[[:space:]]*[=:][[:space:]]*[^[:space:]]"
+# The leading class admits quoting and bracketing ("KEY"=, [KEY]=, - key:) but NOT comment
+# markers. Without excluding them, stock config full of commented examples matched: three
+# "# LU_USERPASSWORD = !!" lines in /etc/libuser.conf on a stock RHEL image produced a
+# world-readable-credential finding, which is the expensive kind of wrong.
+SECRET_ASSIGN_RE="^[[:space:]]*(export[[:space:]]+)?[^A-Za-z0-9#;/*]{0,2}[A-Za-z0-9_.-]*${SECRET_KEYS}[A-Za-z0-9_]{0,8}[^A-Za-z0-9]{0,2}[[:space:]]*[=:][[:space:]]*[^[:space:]]"
 # credentials embedded in connection URIs
 SECRET_URIS='(mysql|postgres(ql)?|mongodb(\+srv)?|redis|rediss|amqps?|ftp|sftp|https?|ldaps?|smb|s3|clickhouse|elasticsearch)://[A-Za-z0-9._%+-]*:[^@/[:space:]"'"'"']{3,}@'
 
@@ -4635,7 +4654,9 @@ printf '%s\n' "$SECRET_FILES" | while IFS= read -r f; do
   for dr in $DOCROOTS; do case "$f" in "$dr"/*) scope="$scope IN-DOCUMENT-ROOT" ;; esac; done
   IFS=$_oifs
   printf '\n[%s] %s%s\n' "$f" "$m" "$scope"
-  printf '%s\n' "$HITS" | grep -v '^$' | while IFS= read -r line; do emit_secret "$f" "$line" "key-name"; done
+  printf '%s\n' "$HITS" | grep -v '^$' \
+    | grep -vE '^[0-9]+:[[:space:]]*(#|;|//|--|/\*|\*)' \
+    | while IFS= read -r line; do emit_secret "$f" "$line" "key-name"; done
   printf '%s\n' "$TOKHITS" | grep -v '^$' | while IFS= read -r line; do
     printf '  %s:%s  <redacted provider token> [%s]\n' "$f" "${line%%:*}" "$(printf '%s' "${line#*:}" | cut -c1-6)…"
   done
@@ -4751,7 +4772,18 @@ for g in $(find "$(rf /var/www)" "$(rf /srv)" "$(rf /opt)" -maxdepth 4 -type d -
   [ -r "$d/.gitignore" ] && grep -qE '^\s*\.env' "$d/.gitignore" 2>/dev/null && printf '    .env is gitignored\n' || printf '    .env NOT in .gitignore\n'
   have git && git -C "$d" log --oneline -1 2>/dev/null | sed 's/^/    last commit: /'
 done
-GITWEB="$(find $DOCROOTS -maxdepth 3 -type d -name '.git' -print 2>/dev/null | head -5)"
+# With no web server, DOCROOTS is empty and GNU find falls back to the CURRENT DIRECTORY, so the
+# check reported the auditor's own working copy as a .git exposed in a document root. Guarded.
+if [ -n "${DOCROOTS//[[:space:]]/}" ]; then
+  GITWEB="$(find $DOCROOTS -maxdepth 3 -type d -name '.git' -print 2>/dev/null | head -5)"
+  GITWEB_SCANNED=1
+else
+  GITWEB=""; GITWEB_SCANNED=0
+fi
+# Emit in every case: a check that stays silent when there is no document root is
+# indistinguishable from one that looked and found nothing.
+[ "$GITWEB_SCANNED" = "0" ] && chk secrets.git_in_webroot NA "no document root identified" "nothing to scan: no web server configuration was found, so this says nothing about whether a repository is exposed"
+[ "$GITWEB_SCANNED" = "1" ] && [ -z "$GITWEB" ] && chk secrets.git_in_webroot PASS "no .git under any document root" ""
 [ -n "$GITWEB" ] && chk secrets.git_in_webroot FAIL "$GITWEB" "a .git directory inside the document root is downloadable object by object — scanners do this automatically and recover the full source history, including any credential ever committed and later removed"
 raw "backup and editor-leftover copies of config files"
 find $DOCROOTS "$(rf /etc)" -maxdepth 4 -type f \( -name '*.bak' -o -name '*.save' -o -name '*.old' -o -name '*~' \

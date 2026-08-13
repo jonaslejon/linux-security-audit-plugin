@@ -9,6 +9,32 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.5.1] — 2026-08-13
+
+Six issues found by auditing the official Red Hat UBI 9 image, the first RPM-based target. All
+six are cross-distro; none were reachable from the Debian images tested before.
+
+### Fixed
+
+- **`/etc/shadow` at mode 000 was reported as a failure.** `stat -c %a` prints `0`, not `000`, and
+  the accepted list contained only the three-digit form. Red Hat ships the strictest possible
+  permission on the most sensitive file on the system, and the collector called it wrong.
+- **`/root` passed only at exactly 0700, so every stricter mode failed too.** Red Hat ships 0550.
+  Anything with no world bits and a root-owned group now passes; a non-root group gets a `WARN`.
+- **Commented-out examples in stock config were reported as credentials.** The leading character
+  class in the secrets regex allowed any two non-alphanumerics before a key name, which admits
+  `# `. Three commented lines in `/etc/libuser.conf` produced a world-readable-credential finding
+  on a stock RHEL image. The class now excludes comment markers. Value-shaped matches (provider
+  tokens, PEM blocks) are deliberately still matched inside comments: a real key commented out is
+  still a real key on disk.
+- **`secrets.git_in_webroot` scanned the auditor's working directory.** With no web server,
+  `$DOCROOTS` is empty and GNU `find` falls back to the current directory, so auditing from a git
+  checkout reported the auditor's own `.git` as exposed in a document root. It now reports `PASS`
+  when document roots were scanned and `NA` when there were none, instead of staying silent.
+- **auditd, remote logging, journald retention and kernel currency are `NA` in a container.** The
+  kernel audit subsystem is not namespaced, container logs go to the runtime's log driver, and the
+  kernel is the host's. UBI reported four failures for controls it cannot implement.
+
 ## [1.5.0] — 2026-08-13
 
 Container reports were mostly noise. Auditing three production images produced 55 non-`PASS` lines
