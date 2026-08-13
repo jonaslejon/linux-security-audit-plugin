@@ -182,6 +182,11 @@ chk()  {
         ;;
     esac
   fi
+  # The delimiter must never appear inside a field. Linux core_pattern starts with a literal '|'
+  # (pipe-to-handler), which silently produced a 7-field record and broke every documented
+  # `awk -F"|"` consumer. Percent-encoded so the value stays readable and reversible.
+  _cob="${_cob//|/%7C}"; _cnt="${_cnt//|/%7C}"
+  _cob="${_cob//$'\n'/ }";  _cnt="${_cnt//$'\n'/ }"
   printf 'CHECK|%s|%s|%s|%s|%s\n' "$_cid" "$_cst" "$_cob" "$_cnt" "$_cm"
   [ -n "$LSA_TALLY" ] && printf 'V %s %s\n' "$_cst" "${_cm%%:*}" >> "$LSA_TALLY"
   return 0
@@ -3368,16 +3373,18 @@ SYSBIN_RE='^/(usr/)?(local/)?(s?bin|lib|lib64|libexec)/|^/usr/lib(exec)?/|^/boot
 
 if [ "$QUICK" = "1" ]; then
   chk integrity.package_verify NA "skipped (--quick)" "full package verification checksums every packaged file and is I/O-bound; re-run without --quick"
-elif have dpkg; then
+elif [ "$OFFLINE" = "1" ] && [ -z "$DPKGOPT" ] && [ -z "$RPMOPT" ]; then
+  chk integrity.package_verify NA "no package database in the mounted tree" "without the image's own dpkg/rpm database there is nothing to verify against; verifying with the auditing host's database would describe the wrong machine"
+elif have dpkg && { [ "$OFFLINE" = "0" ] || [ -n "$DPKGOPT" ]; }; then
   # dpkg --verify is built into dpkg >=1.17 — no extra package required, unlike debsums
   raw "dpkg --verify (built in; flags are ??5?????? = md5 mismatch, 'c' marks a conffile)"
-  DPKGV="$(tmo 600 dpkg --verify 2>/dev/null)"
+  DPKGV="$(tmo 600 dpkg ${DPKGOPT:-} --verify 2>/dev/null)"
   PKGV_RUN=yes
   printf '%s\n' "$DPKGV" | cap 60
   PKGV_CFG="$(printf '%s\n' "$DPKGV" | grep -c ' c /' )"
   PKGV_MISS="$(printf '%s\n' "$DPKGV" | grep -c '^missing' )"
   PKGV_BIN="$(printf '%s\n' "$DPKGV" | grep -v ' c /' | grep -oE '/[^ ]+$' | grep -E "$SYSBIN_RE" | head -25 | tr '\n' ' ')"
-  if have debsums; then
+  if have debsums && [ "$OFFLINE" = "0" ]; then
     raw "debsums -c (cross-check; covers only packages that shipped md5sums)"
     tmo 600 debsums -c 2>/dev/null | cap 30
     NOSUMS="$(tmo 120 debsums -l 2>/dev/null | wc -l | tr -d ' ')"
@@ -3385,9 +3392,9 @@ elif have dpkg; then
   else
     chk integrity.pkgverify_tooling INFO "debsums not installed" "dpkg --verify covers the same ground for md5 mismatches; debsums additionally reports which packages have no checksums to verify against"
   fi
-elif have rpm; then
+elif have rpm && { [ "$OFFLINE" = "0" ] || [ -n "$RPMOPT" ]; }; then
   raw "rpm -Va (S=size M=mode 5=digest D=device L=symlink U=user G=group T=mtime P=capabilities)"
-  RPMV="$(tmo 900 rpm -Va --nodeps --noscripts 2>/dev/null)"
+  RPMV="$(tmo 900 rpm ${RPMOPT:-} -Va --nodeps --noscripts 2>/dev/null)"
   PKGV_RUN=yes
   printf '%s\n' "$RPMV" | cap 60
   PKGV_CFG="$(printf '%s\n' "$RPMV" | grep -c ' c /' )"
@@ -3632,7 +3639,7 @@ grep -rhsE 'authorized' "$(rf /etc/udev/rules.d/)" 2>/dev/null | cap 10
 # --- 4. module-level: block the drivers that make a rogue device useful ---
 USBMODS=""
 for m in usb_storage uas usbnet cdc_ether rndis_host cdc_ncm usbhid hid_generic; do
-  if printf '%s' "$MPD" | grep -qE "^\s*install\s+$(printf '%s' "$m" | tr '_' '[_-]')\s+/bin/(false|true)" \
+  if printf '%s' "$MPD" | grep -qE "^\s*install\s+$(printf '%s' "$m" | sed 's/_/[_-]/g')\s+/bin/(false|true)" \
      || printf '%s' "$MPD" | grep -qE "^\s*blacklist\s+$m\s*$"; then :; else USBMODS="$USBMODS $m"; fi
 done
 [ -n "$USBMODS" ] && chk usb.module_blacklist WARN "not blocked:$USBMODS" "usb_storage/uas enable mass-storage exfiltration; usbnet/cdc_ether/rndis let a USB device become a network interface and hijack routing/DNS; usbhid is the BadUSB keystroke-injection path (blocking it disables real keyboards — only for headless hosts)" \

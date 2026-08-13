@@ -159,7 +159,9 @@ a finding.
 The output has two kinds of content:
 
 - `CHECK|<id>|<PASS|FAIL|WARN|INFO|NA>|<observed>|<note>|<static|runtime|active>` — deterministic
-  checks. Grep these first: `grep '^CHECK|' $OUT | grep -v '|PASS|'`.
+  checks. Grep these first: `grep '^CHECK|' $OUT | grep -v '|PASS|'`. Every record has exactly six
+  fields: a `|` occurring inside a value is emitted as `%7C` so `awk -F'|'` stays correct. Linux
+  `core_pattern` is the common case, since a leading `|` there means "pipe to this handler".
 - `===== SECTION X =====` blocks of raw evidence — these need judgement (firewall rules, SUID
   list, running services, cron contents, sudoers). Read them; do not just count `FAIL` lines.
 

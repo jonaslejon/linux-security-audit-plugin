@@ -80,6 +80,21 @@ Everything here was reported by Patrik Solsten, who cloned the repo and actually
   the running host. Silently auditing the wrong machine under an offline banner is the worst
   outcome this tool has.
 
+### Fixed (found by the new CI on its first run against a real Linux host)
+
+- **A `|` inside a value broke the record contract.** Linux `core_pattern` begins with a literal
+  `|` meaning "pipe to this handler", which produced a seven-field `CHECK` record and silently
+  mis-parsed under the `awk -F'|'` consumers the skill itself documents. Delimiters inside values
+  are now percent-encoded, and CI asserts every record has exactly six fields.
+- **Offline package verification ran against the auditing host.** `dpkg --verify` and `rpm -Va`
+  ignored the `--admindir`/`--dbpath` options the query paths already used, so auditing an image
+  from a Debian host checksummed the auditor's own packages under a 600-second timeout. That is
+  both a wrong answer and what made an offline run appear to hang. Now uses the image's database,
+  or reports `NA` when the tree has none.
+- **`tr '_' '[_-]'` was not doing anything.** `tr` maps characters, not strings, so the USB module
+  blacklist check turned `_` into `[` and GNU `tr` rejected the reversed range outright, printing
+  an error per module. It never matched a `-` separated module name. Now a `sed` character class.
+
 ### Added
 
 - **CI, tests and a security policy.** There were none, which for a tool run as root on production
