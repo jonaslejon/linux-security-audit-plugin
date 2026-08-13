@@ -36,6 +36,10 @@ baked into a golden template: it reported on the auditor's own keys. Reported by
   empty mode. This violated the collector's own `statmode` contract.
 - **`umask.effective` and `privesc.path` retagged `runtime`.** Both read the auditing shell's own
   environment, so offline they described the auditor entirely.
+- **The orphaned-package check no longer forks once per package.** It ran up to 800 sequential
+  `apt-cache policy` invocations, unbounded and not covered by `--quick`, which is enough to make
+  a run look like it has hung; it now passes the list through `xargs` under a timeout. The dnf
+  equivalent ran its slowest query twice, once without a timeout.
 - **`rp_filter`**: the reference table claimed a per-interface value overrides `all`. The effective
   value is `max(all, <iface>)`, as the same document's traps section already said correctly.
 

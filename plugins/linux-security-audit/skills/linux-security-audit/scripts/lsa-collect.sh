@@ -2738,11 +2738,13 @@ fi
 # --- packages NOT provided by any configured repository: these never get security updates ---
 raw "packages with no candidate in any configured repository (orphaned / locally installed)"
 if have apt-cache && have dpkg-query; then
-  ORPH="$(dpkg-query -f '${binary:Package}\n' -W 2>/dev/null | head -800 | while read -r pk; do
-      [ -n "$pk" ] || continue
-      c="$(apt-cache policy "$pk" 2>/dev/null | awk '/Candidate:/{print $2}')"
-      [ "$c" = "(none)" ] && printf '%s ' "$pk"
-    done)"
+  # One apt-cache call per package meant up to 800 forks here, unbounded and not covered by
+  # --quick, which is enough to make the whole run look like it has hung. apt-cache policy takes
+  # a package list, so xargs turns that into one or two invocations.
+  ORPH="$(dpkg-query -f '${binary:Package}\n' -W 2>/dev/null | head -800 \
+          | tmo 120 xargs -r apt-cache policy 2>/dev/null \
+          | awk '/^[^[:space:]][^:]*:$/ { pk=substr($0,1,length($0)-1) }
+                 /Candidate:/ { if ($2=="(none)") printf "%s ", pk }')"
   if [ -n "$ORPH" ]; then
     chk packages.orphaned FAIL "$(printf '%s' "$ORPH" | cut -c1-200)" "installed but no repository offers them any more — a locally installed .deb, or a PPA/vendor repo that was removed. These receive NO security updates and no CVE feed covers them. Either restore the repo or remove the package"
   else
@@ -2754,8 +2756,11 @@ if have apt-cache && have dpkg-query; then
   [ "${HELD:-0}" -gt 0 ] && chk packages.held WARN "${HELD} package(s) on hold" "held packages are excluded from security updates — confirm each hold is still justified"
 elif have dnf; then
   raw "packages not in any repository (dnf repoquery --extras)"
-  run dnf -q repoquery --extras 2>/dev/null | head -20
-  EXTRA="$(dnf -q repoquery --extras 2>/dev/null | wc -l | tr -d ' ')"
+  # Run once and reuse: the second, unbounded call doubled the cost of the slowest query in
+  # this section on a host with a large repo set.
+  DNFX="$(run dnf -q repoquery --extras 2>/dev/null)"
+  printf '%s\n' "$DNFX" | head -20
+  EXTRA="$(printf '%s\n' "$DNFX" | grep -c .)"
   [ "${EXTRA:-0}" -gt 0 ] && chk packages.orphaned FAIL "${EXTRA} package(s) not provided by any repo" "no security updates reach these"
 fi
 
