@@ -1,6 +1,6 @@
 ---
 name: linux-security-audit
-description: Audit a Linux host's security hardening posture and produce a risk-ranked report, using both passive config inspection and active service probing. Covers kernel sysctls, boot parameters, mount options (nosuid/noexec/nodev), module blacklists, core dumps, SUID/SGID files, SELinux/AppArmor including unconfined domains, processes running as root, local privilege-escalation paths (sudoers Defaults and GTFOBins-capable grants, sudo env_keep, writable systemd units, writable PATH, NFS no_root_squash, exposed credentials, shell-history anti-forensics), root cron jobs reading or globbing user-writable data, the boot and service-start trust chain (systemd EnvironmentFile/Exec/Condition paths, ld.so search paths, udev RUN targets, files currently open in and libraries mapped into root processes), insecure-by-default services (telnet, rsh, FTP, TFTP, rsync daemon anonymous write, Samba guest shares and SMB1, open mail relay, open DNS resolver, open proxy, memcached, VNC, xinetd/inetd), database and SNMP authentication, USB device restriction (USBGuard), firewall rules, exposed listening ports, TLS cipher and protocol validation, mutual-TLS enforcement on internal tunnels, web server hardening (nginx/Apache/PHP/certs/security headers/webroot exposure), repository GPG verification, prohibited packages on hardened hosts (compilers, tcpdump/wireshark, network and debug tooling), image and template hygiene (SSH host keys or entropy seeds baked into a golden image, uninitialised machine-id, cloud-init state, per-instance enrolment material), cleartext secrets on disk (.env files, API keys such as sk-ant-*/AWS/GitHub/Stripe, connection-string credentials, embedded and standalone private keys) reported with values redacted, .htaccess and .user.ini contents, NTP and time-source security, SSH server and client config, sudoers, GRUB password, disk encryption, remote logging, log retention periods, log file readability by unprivileged users, auditd, file-integrity monitoring, package checksum verification (dpkg --verify/debsums/rpm -Va, separating config drift from modified binaries), cron, and writable directories. Use when asked to security-audit, hardening-review, CIS-check, or harden a Linux server or web server (local, over SSH, in a container, or against a mounted image), or to verify a specific hardening control is in place.
+description: Audit a Linux host's security hardening posture and produce a risk-ranked report of what to fix. Covers the kernel and boot chain, filesystems and mount options, SELinux/AppArmor, accounts and sudo, SSH, firewall and exposed ports, TLS and mutual-TLS enforcement, web servers, insecure-by-default services, packages, logging and auditd, containers, and cleartext secrets on disk, combining passive config inspection, live runtime state and optional active probing. Use when asked to security-audit, hardening-review, CIS-check or harden a Linux server or web server, locally, over SSH, in a container, or against a mounted image, or to verify a specific hardening control is in place.
 ---
 
 # Linux Security Audit
@@ -25,8 +25,10 @@ started, stopped or reloaded, no package is installed. Two side effects worth kn
   signed requires it.
 
 Load, not risk, is the real production consideration: the whole-filesystem walks (SUID,
-world-writable, secrets) do read I/O proportional to disk size. Use `--quick` on large or slow
-storage. Runs on this codebase complete in a few seconds.
+world-writable, secrets) and package checksum verification (`dpkg --verify`, `rpm -Va`) do read I/O
+proportional to disk size, and on a large host the package pass alone can run for minutes. Use
+`--quick` to skip both on large or slow storage. The output header reports total elapsed time and
+the slowest sections, so quote those rather than guessing.
 
 **`scripts/lsa-trace.sh` is different and is deliberately kept separate.** `--live` is read-only,
 but `--unit` restarts a service and `--boot arm` writes audit rules and needs a reboot. Every mode
@@ -69,10 +71,18 @@ practitioner hardening practice.
 Run the collector. It is one self-contained bash script — prefer it over dozens of ad-hoc
 commands, both for speed and so nothing is silently skipped.
 
-```bash
-SK=~/.claude/skills/linux-security-audit/scripts/lsa-collect.sh
-OUT=/tmp/lsa-<host>-$(date +%Y%m%d).txt      # or any working directory
+Locate the collector rather than assuming a path: it moves depending on whether the skill was
+installed as a plugin, cloned as a marketplace, or dropped into `~/.claude/skills`.
 
+```bash
+SK="$(find "${CLAUDE_PLUGIN_ROOT:-$HOME/.claude}" "$HOME/.claude/plugins" "$HOME/.claude/skills" \
+        -name lsa-collect.sh -path '*linux-security-audit*' 2>/dev/null | head -1)"
+[ -n "$SK" ] || echo 'collector not found — check the plugin is installed'
+
+OUT=/tmp/lsa-<host>-$(date +%Y%m%d).txt      # or any working directory
+```
+
+```bash
 # local
 sudo bash "$SK" > "$OUT"
 
@@ -86,27 +96,39 @@ docker run --rm -i <image> bash -s < "$SK" > "$OUT"
 ```
 
 ```bash
-# golden image / ISO / unbooted system — mount it, chroot in, run passively
-mount -o loop,ro image.raw /mnt && chroot /mnt bash -s --passive < "$SK" > "$OUT"
+# golden image / ISO / unbooted system — mount it and point --root at the mountpoint
+mount -o loop,ro image.raw /mnt
+sudo bash "$SK" --root /mnt > "$OUT"
 ```
 
-Flags: `--quick` skips the whole-filesystem walks (SUID/SGID, world-writable, capabilities) on
-big or slow disks. `--passive` (alias `--no-probe`) disables every active check. `--out FILE`
-writes to a file on the target instead of stdout.
+**Use `--root`, never `chroot`, for an offline tree.** Inside a `chroot` the collector cannot tell
+that it is offline: `systemctl`, `sudo -l`, `apachectl` and `/proc` reads return "absent" or "not
+set" rather than failing, and the collector turns that into `FAIL` on controls that are actually
+correct. `--root` makes the offline context explicit, so every check that needs a running kernel
+reports `NA` instead. This is the difference between a thin report and a wrong one.
+
+Flags: `--root PATH` audits a mounted filesystem offline and forces `--passive`. `--quick` skips
+the whole-filesystem walks (SUID/SGID, world-writable, capabilities, package checksums) on big or
+slow disks. `--passive` (alias `--no-probe`) disables every active check. `--out FILE` writes to a
+file on the target instead of stdout. `--apt-update` opts in to refreshing the APT lists.
 
 ### Passive and active checks
 
 The collector uses both, and tags every `CHECK` line with which produced it:
 
-- **`static`** (~31%) — reads files on disk only. These are the checks that work against a mounted
-  image or `chroot`: sudoers, secrets, module blacklists, log retention, cron, SSH config, package
-  and repo trust.
-- **`runtime`** (~66%) — reads live kernel and process state: `/proc/sys` sysctls, `/proc/cmdline`,
+- **`static`** — reads files on disk only. These are the checks that work under `--root` against a
+  mounted image: sudoers, secrets, module blacklists, log retention, cron, SSH config, package and
+  repo trust.
+- **`runtime`** — reads live kernel and process state: `/proc/sys` sysctls, `/proc/cmdline`,
   `lsmod`, `ps`, `ss`, `systemctl is-active`, `/proc/<pid>/fd`, or queries an installed binary
   (`nginx -V`). Safe on production and it touches no service, **but it is meaningless on an offline
-  image** — on a chroot these correctly report `NA`, they do not pass.
-- **`active`** (~3%) — interacts with a service or the network: local TLS handshakes, an HTTP
-  request to loopback, `apt-get update`, NTP source queries, `sudo -l`. Suppressed by `--passive`.
+  image** — under `--root` these report `NA`, they do not pass.
+- **`active`** — interacts with a service or the network: local TLS handshakes, an HTTP request to
+  loopback, `apt-get update`, NTP source queries, `sudo -l`. Suppressed by `--passive`.
+
+The run's actual distribution is printed in the output header (`method_counts=`) along with total
+elapsed time and per-section timings. Quote those numbers in the report rather than any figure from
+this file, which will drift as checks are added.
 
 Some controls are visible on **both** sides — a sysctl has a value in `/proc/sys` and an assignment
 in `/etc/sysctl.d`. The `DRIFT` section compares them and reports the *direction* of any
@@ -115,9 +137,9 @@ disagreement: `RUNTIME-ONLY` (applied but not persisted — reverts at reboot) o
 section before trusting any other PASS, because it is exactly where a config-based audit and a
 runtime-based audit reach opposite conclusions.
 
-The three-way split matters because **"not active" does not mean "works offline"**. Two thirds of
-the checks need a booted system. When auditing an image, expect roughly a third of the check set to
-produce verdicts and say so in the report rather than presenting a thin pass list as full coverage.
+The three-way split matters because **"not active" does not mean "works offline"**. Most of the
+check set needs a booted system. When auditing an image, expect only the `static` share to produce
+verdicts, and say so in the report rather than presenting a thin pass list as full coverage.
 
 Some things **cannot** be established passively, and saying otherwise would be wrong: which cipher
 suites and protocol versions a server actually negotiates (that depends on the TLS library build

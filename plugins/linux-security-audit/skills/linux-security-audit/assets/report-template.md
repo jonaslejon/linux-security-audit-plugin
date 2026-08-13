@@ -29,11 +29,17 @@ account, unexplained SUID binary, unknown cron entry, modified system binary). T
 
 State the mode and its limits, because they decide which verdicts are trustworthy:
 
+Every row below is printed by the collector in its `RUN_SUMMARY` section. Copy the values from
+there rather than counting by hand or quoting a figure from the documentation, which drifts.
+
 | | |
 |---|---|
 | Mode | live root / live non-root / `--root <path>` offline / container |
-| Checks by method | `static` N, `runtime` N, `active` N |
-| `NA` count | N — **these are undetermined, not passes** |
+| Collector version | `collector_version` + `collector_sha256` — pins the report to a check set |
+| Elapsed | `elapsed_seconds`, and `slowest_sections` if anything ran long |
+| Checks by method | `method_counts`: `static` N, `runtime` N, `active` N |
+| Undetermined | `undetermined_pct` — **NA is not a pass** |
+| Truncated evidence | any raw list at exactly its cap (`head -N`) is incomplete; say which |
 
 A `FAIL` from this collector means *checked and wrong*. A check whose prerequisite was missing
 emits `NA` with the reason instead. If any check carries `:degraded` in its method field, or the
@@ -43,6 +49,12 @@ them** — a manufactured finding costs more credibility than a missed one.
 Known blind spots by mode: non-root cannot read `/etc/sudoers`, `/etc/shadow` or the firewall
 ruleset; `--root` cannot see sysctls, listeners, processes, loaded modules or live TLS; a container
 sees the host's kernel, not its own.
+
+Under `--root`, `undetermined_pct` is typically well over half. That is the expected shape of an
+offline audit, not a defect, but it means the report must lead with what was **not** covered. An
+image that passes every check it was possible to run offline has not been shown to be hardened; it
+has been shown not to be misconfigured in the ways a filesystem can reveal. Say that explicitly,
+and pair the image audit with a run against a booted instance before signing anything off.
 
 ## Findings
 

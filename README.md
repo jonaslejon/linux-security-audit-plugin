@@ -46,13 +46,23 @@ TLS listeners and eBPF programs loaded emits far more than a minimal one. Covera
 | Mounted image | `--root /mnt` | configuration only; runtime checks report `NA` |
 | Container | run inside it | container-level checks; host-owned ones report `NA` |
 
+Use `--root` for an offline tree, never `chroot`. Inside a `chroot` the collector cannot tell it
+is offline: `systemctl`, `sudo -l` and `/proc` reads return "absent" rather than failing, and a
+check that turns a failed read into a `FAIL` has manufactured a finding. `--root` makes the
+context explicit, so those checks report `NA` instead.
+
+Every run ends with a `RUN_SUMMARY` section giving the collector version and hash, elapsed time,
+the slowest sections, the verdict spread and the real `static`/`runtime`/`active` split. Quote
+those figures in a report rather than any number written down here.
+
 ## Running it
 
 The plugin drives this for you, but the collector is a standalone script with no dependencies
 beyond a POSIX shell and the tools it audits:
 
 ```bash
-S=~/.claude/plugins/.../skills/linux-security-audit/scripts/lsa-collect.sh
+# the plugin install path varies; locate the collector rather than guessing
+S="$(find "$HOME/.claude" -name lsa-collect.sh -path '*linux-security-audit*' 2>/dev/null | head -1)"
 
 # a live host, over SSH, leaving nothing behind on the target
 ssh -p 22 user@host 'sudo bash -s' < "$S" > report.txt
@@ -69,7 +79,7 @@ docker run --rm -i <image> bash -s < "$S" > image-report.txt
 
 | Flag | Effect |
 |---|---|
-| `--quick` | Skip whole-filesystem walks (SUID, world-writable, secrets). Use on large or slow storage |
+| `--quick` | Skip whole-filesystem walks (SUID, world-writable, secrets) and package checksum verification. Use on large or slow storage |
 | `--passive` (`--no-probe`) | Disable every active check — no loopback connections, no NTP queries |
 | `--root PATH` | Offline mode against a mounted filesystem; runtime checks report `NA` |
 | `--apt-update` | Also run `apt-get update` to test repo signatures. **The only thing that writes anything** |

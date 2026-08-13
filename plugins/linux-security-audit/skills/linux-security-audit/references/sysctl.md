@@ -69,7 +69,7 @@ Report which mechanism the host actually supports, not a generic FAIL for the ab
 |---|---|---|
 | `net.ipv4.tcp_syncookies` | `1` | SYN flood resilience |
 | `net.ipv4.tcp_rfc1337` | `1` | Drops RST packets for sockets in TIME-WAIT |
-| `net.ipv4.conf.{all,default}.rp_filter` | `1` | Reverse-path filtering — drops spoofed sources. **`1` (strict) breaks asymmetric routing and multi-homed/VPN hosts**; `2` (loose) is the safe choice there. Modern kernels also honour a per-interface value that overrides `all` |
+| `net.ipv4.conf.{all,default}.rp_filter` | `1` | Reverse-path filtering — drops spoofed sources. **`1` (strict) breaks asymmetric routing and multi-homed/VPN hosts**; `2` (loose) is the safe choice there. The effective value is `max(all, <iface>)`, not an override; see *Distro and version traps* |
 | `net.ipv4.conf.{all,default}.accept_redirects` | `0` | ICMP redirects rewriting your routing table |
 | `net.ipv6.conf.{all,default}.accept_redirects` | `0` | |
 | `net.ipv4.conf.{all,default}.secure_redirects` | `0` | |
@@ -113,9 +113,11 @@ Report which mechanism the host actually supports, not a generic FAIL for the ab
 
 ## A conservative persisted baseline
 
-Server-safe subset — high value, low breakage. Drop into `/etc/sysctl.d/99-hardening.conf`, then
+Server-safe subset: high value, low breakage. Drop into `/etc/sysctl.d/99-hardening.conf`, then
 `sysctl --system` and check for errors. The POLICY items above are deliberately excluded; add them
 only after deciding the trade-off per host.
+
+**Unconditional.** Every line below applies on any kernel this skill targets.
 
 ```ini
 kernel.kptr_restrict = 2
@@ -124,21 +126,16 @@ kernel.printk = 3 3 3 3
 kernel.unprivileged_bpf_disabled = 1
 net.core.bpf_jit_harden = 2
 dev.tty.ldisc_autoload = 0
-dev.tty.legacy_tiocsti = 0
 kernel.kexec_load_disabled = 1
 vm.unprivileged_userfaultfd = 0
 kernel.sysrq = 4
-kernel.perf_event_paranoid = 3
 kernel.randomize_va_space = 2
-kernel.yama.ptrace_scope = 2
 kernel.core_pattern = |/bin/false
 fs.suid_dumpable = 0
 fs.protected_symlinks = 1
 fs.protected_hardlinks = 1
 fs.protected_fifos = 2
 fs.protected_regular = 2
-vm.mmap_rnd_bits = 32
-vm.mmap_rnd_compat_bits = 16
 vm.swappiness = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 1
@@ -148,16 +145,44 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_source_route = 0
 net.ipv4.conf.all.log_martians = 1
 ```
+
+**Conditional.** Each of these is correct advice on the right host and a `systemd-sysctl` boot
+error or a broken workflow on the wrong one. Check the precondition, then move the line into the
+file above. Do not paste this block wholesale.
+
+```ini
+# kernel >= 6.2 only. Older kernels have no equivalent; the line fails to apply.
+dev.tty.legacy_tiocsti = 0
+
+# Debian/Arch/hardened patch only. Mainline caps at 2 and may accept 3 while behaving as 2,
+# so a PASS on read-back is not proof it took effect.
+kernel.perf_event_paranoid = 3
+
+# Blocks root from ptrace-ing non-descendants, which breaks gdb, strace, perf attach and
+# most crash/debug tooling. Use 1 on hosts that are ever debugged in place.
+kernel.yama.ptrace_scope = 2
+
+# Fails to apply above CONFIG_ARCH_MMAP_RND_BITS_MAX for the architecture. 32 suits x86_64;
+# check /proc/sys/vm/mmap_rnd_bits for the ceiling before setting it elsewhere.
+vm.mmap_rnd_bits = 32
+vm.mmap_rnd_compat_bits = 16
+
+# Drops silently when IPv6 is off at boot (ipv6.disable=1), taking the whole file's
+# remaining lines with it on some systemd versions. Omit these if IPv6 is disabled.
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+```
+
+After applying, confirm nothing failed: `systemd-analyze verify` will not catch these, so use
+`journalctl -u systemd-sysctl -b` and treat any line there as an unapplied control, not a warning.
 
 `kernel.modules_disabled = 1` is deliberately **not** in this file: applied at sysctl time it can
 run before every needed module has loaded. Set it from a late-boot unit instead — see

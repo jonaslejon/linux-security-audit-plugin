@@ -9,6 +9,57 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.4.0] — 2026-08-13
+
+Offline mode did not work. `--root` was wired into two sections and nowhere else, so 270 of the
+277 filesystem path operands read the machine running the audit instead of the mounted image.
+The section worst affected was `IMAGE_HYGIENE`, whose entire purpose is finding SSH host keys
+baked into a golden template: it reported on the auditor's own keys. Reported by Patrik Solsten.
+
+### Fixed
+
+- **`--root` now resolves every path read against the mounted tree.** All 277 operands go through
+  `rf()` (or `"$LSA_ROOT"` where a glob must still expand). Verified against a fixture root: every
+  `FAIL` is now a property of the fixture, where previously 9 of 32 described the auditing host.
+- **Runtime and active checks can no longer produce a verdict offline.** Enforced centrally in
+  `chk()` rather than at each call site, because a guard that must be remembered 270 times gets
+  missed, and the failure mode of missing one is a manufactured finding.
+- **Whole-filesystem walks no longer scan the auditing host offline.** `SCANDIRS` consulted
+  `findmnt`, a runtime tool, so `--root` walked the auditor's entire disk. This also made the run
+  appear to hang: it never completed rather than taking a long time.
+- **Binary-presence checks resolve inside the target.** `have` searches the auditor's `PATH`, so
+  `packages.prohibited` and `hardening.compilers` reported the auditor's toolchain as the image's.
+  New `have_target` looks inside the tree offline.
+- **Docker section no longer triggers on the auditor's socket.** Auditing an image from a
+  workstation running Docker Desktop produced a full set of daemon findings about the workstation.
+- **`perm./etc/shadow` emits `NA` when the file is absent or unreadable**, instead of `FAIL` on an
+  empty mode. This violated the collector's own `statmode` contract.
+- **`umask.effective` and `privesc.path` retagged `runtime`.** Both read the auditing shell's own
+  environment, so offline they described the auditor entirely.
+- **`rp_filter`**: the reference table claimed a per-interface value overrides `all`. The effective
+  value is `max(all, <iface>)`, as the same document's traps section already said correctly.
+
+### Changed
+
+- **`SKILL.md` no longer instructs `chroot` for offline trees.** It taught the one approach the
+  collector's own header calls finding-fabricating, while never mentioning `--root` at all. Inside
+  a `chroot` the collector cannot tell it is offline, so runtime tools return "absent" and become
+  `FAIL` on controls that are correct.
+- **The collector locates itself.** `SKILL.md` and the README both hardcoded paths that do not
+  exist after `/plugin install`.
+- **New `RUN_SUMMARY` section** reports collector version and SHA, elapsed time, the five slowest
+  sections, the verdict spread, and the real `static`/`runtime`/`active` distribution. The
+  hardcoded "~31%/~66%/~3%" in `SKILL.md` was wrong (measured: 41/59) and would have drifted again.
+- **The conservative sysctl baseline is split into unconditional and conditional blocks.** It
+  previously shipped `perf_event_paranoid=3`, `legacy_tiocsti=0` and `mmap_rnd_bits=32` unmarked,
+  each of which fails to apply on the wrong kernel, in a file the same document warns will produce
+  `systemd-sysctl` boot errors. `yama.ptrace_scope=2` is now marked as breaking in-place debugging.
+- **`SKILL.md` frontmatter description cut from 295 words to 3 sentences.** It had grown into the
+  full check catalogue, which belongs in `checklist.md`; a wall of text makes skill matching worse,
+  not better, and costs context in every session where the skill is considered.
+- Report template gained collector version/SHA, elapsed time and truncation rows, and now states
+  that a high `undetermined_pct` under `--root` is the expected shape of an offline audit.
+
 ## [1.3.0] — 2026-08-12
 
 ### Added
