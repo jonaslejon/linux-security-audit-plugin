@@ -67,8 +67,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned image, because the ID universe depends on the auditing environment: which checks
+      # fire at all varies with installed tooling and with whether the auditor is itself a
+      # container. The baseline is generated in this same image, so the comparison is meaningful.
       - name: No check may stop emitting
-        run: bash tests/check-registry.sh
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo debian:stable-slim \
+            bash tests/check-registry.sh
 
   # The collector's whole purpose is to run on a booted Linux host, so CI runs it on one. This is
   # the coverage that fixture tests cannot give: real /proc, real systemd, a real package database.

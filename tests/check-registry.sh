@@ -17,9 +17,14 @@ BASELINE="${SELF_DIR}/fixtures/offline-check-ids.txt"
 UPDATE=0
 [ "${1:-}" = "--update" ] && UPDATE=1
 
-# The ID universe is platform-dependent: which checks exist at all depends on the auditing
-# platform's userland. This tool supports Linux, so the baseline is a Linux baseline, and running
-# it anywhere else would compare against a fixture that was never meant to describe that platform.
+# The ID universe depends on the auditing ENVIRONMENT, not just the target: which checks fire at
+# all varies with the tooling installed and with whether the auditor is itself a container (the
+# container.* family only exists then). So the baseline is pinned to one image, and both generating
+# and checking it must happen there:
+#
+#   docker run --rm -v "$PWD:/repo" -w /repo debian:stable-slim bash tests/check-registry.sh [--update]
+#
+# CI runs exactly that. Running it directly on some other Linux box will report spurious drift.
 if [ "$(uname -s)" != "Linux" ]; then
   printf 'check registry: SKIP (baseline is Linux-only; this is %s)\n' "$(uname -s)"
   printf '  run it in a container:\n'
