@@ -14,7 +14,11 @@ depends on what it actually runs, with absent subsystems collapsing to a single 
 Offline mode did not work. `--root` was wired into two sections and nowhere else, so 270 of the
 277 filesystem path operands read the machine running the audit instead of the mounted image.
 The section worst affected was `IMAGE_HYGIENE`, whose entire purpose is finding SSH host keys
-baked into a golden template: it reported on the auditor's own keys. Reported by Patrik Solsten.
+baked into a golden template: it reported on the auditor's own keys.
+
+This release also closes a redaction leak that put a live API key in the report, makes argument
+handling fail closed, and adds the CI and regression tests that would have caught all of it.
+Everything here was reported by Patrik Solsten, who cloned the repo and actually ran it.
 
 ### Fixed
 
@@ -40,8 +44,54 @@ baked into a golden template: it reported on the auditor's own keys. Reported by
   `apt-cache policy` invocations, unbounded and not covered by `--quick`, which is enough to make
   a run look like it has hung; it now passes the list through `xargs` under a timeout. The dnf
   equivalent ran its slowest query twice, once without a timeout.
+- **Three checks asserted a control was in place after reading nothing.** `users.uid0` reported
+  "1 UID-0 account" when `/etc/passwd` was unreadable, `users.shadow_group` reported the group
+  empty when the group database was absent (and queried the auditing host's NSS rather than the
+  image), and `bootchain.ld_so_path` reported the linker search path clean when there was no
+  `ld.so.conf` to enumerate. All three now emit `NA`. Found by the new empty-tree assertion.
+- **`image.logs_in_image` measured the auditing host's `/var/log`**, so an image audit reported
+  the auditor's log volume as the template's.
+- **Paths containing spaces are no longer skipped.** Loops over discovered file lists split on the
+  default `IFS`, so a private key under `/home/anna karlsson/.ssh/` was passed over without a
+  trace. Newline-only `IFS` is now scoped to those loops specifically; the many loops that iterate
+  space-separated scalars (mount options, module names, ports) keep default splitting.
+- **`--out` no longer merges stderr into the record stream.** `stat` and `grep` warnings landed
+  between `CHECK|` records and broke the `grep '^CHECK|'` contract. Diagnostics go to
+  `<file>.stderr`.
+- **Metadata agreed nowhere.** `marketplace.json` claimed 249 checks across 31 areas, the README
+  claimed 450+ across 33, and the collector implements 457 across 33. All three are now synced and
+  asserted in CI. `plugin.json` gained `license`, `homepage`, `repository` and `keywords`.
 - **`rp_filter`**: the reference table claimed a per-interface value overrides `all`. The effective
   value is `max(all, <iface>)`, as the same document's traps section already said correctly.
+
+### Security
+
+- **A secret could be printed into the report.** Redaction of systemd `Environment=` lines used a
+  `sed` anchored on the last `=`, so a unit carrying two variables masked only the second:
+  `Environment=API_KEY=abc123 DB_SECRET=hunter2` published the API key verbatim. Replaced with a
+  redactor that masks every value on the line and collapses the whole remainder when a quoted
+  value could hide a token boundary. A regression test now plants a two-variable secret and fails
+  if either value reaches the output.
+- **Unknown flags no longer fall through to the defaults.** A typo'd `--pasive` left active
+  probing enabled, so a run intended to touch nothing opened TLS handshakes and HTTP requests to
+  production services without a warning. Unknown options now exit 2.
+- **`--root` with a missing or invalid argument is fatal.** It previously left the prefix empty
+  while still setting offline mode, so the report was headed `MODE: OFFLINE` and then described
+  the running host. Silently auditing the wrong machine under an offline banner is the worst
+  outcome this tool has.
+
+### Added
+
+- **CI, tests and a security policy.** There were none, which for a tool run as root on production
+  is the largest single reason not to trust it. Added `.github/workflows/ci.yml` (shellcheck,
+  syntax, manifest validation, both test suites, and a live collection on a real Linux runner),
+  `tests/offline-regression.sh`, `tests/metadata-consistency.sh`, `SECURITY.md` and
+  `CONTRIBUTING.md`. The live smoke job matters most: until now nothing had exercised the
+  collector on a booted Linux host as part of the build.
+- **`cap` replaces `head -N` on 119 evidence lists.** Truncation was silent, so a host with 213
+  SUID binaries reported 80 and read as a complete list. Lists now state how many were dropped,
+  and `truncated_lists` appears in the run summary. Five lists were being truncated on the
+  development machine alone.
 
 ### Changed
 

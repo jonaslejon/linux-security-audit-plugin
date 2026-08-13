@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
+      - name: Lint the tracer and the test suite
+        run: |
+          shellcheck -S warning \
+            plugins/linux-security-audit/skills/linux-security-audit/scripts/lsa-trace.sh \
+            tests/*.sh
+      # The collector is large enough that shellcheck needs a raised stack to analyse it, and it
+      # OOMs at the default limit. Informational rather than blocking so a shellcheck resource
+      # limit cannot gate a security fix, but the output is still surfaced in the log.
+      - name: Lint the collector (informational)
+        continue-on-error: true
+        run: |
+          ulimit -s unlimited || true
+          shellcheck -S error \
+            plugins/linux-security-audit/skills/linux-security-audit/scripts/lsa-collect.sh
+
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every shell script
+        run: |
+          for f in $(git ls-files '*.sh'); do
+            bash -n "$f" || { echo "syntax error: $f"; exit 1; }
+          done
+      - name: Validate the plugin manifests
+        run: |
+          python3 -c "import json,sys; [json.load(open(p)) for p in sys.argv[1:]]" \
+            .claude-plugin/marketplace.json \
+            plugins/linux-security-audit/.claude-plugin/plugin.json
+
+  offline-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline (--root) contract
+        run: bash tests/offline-regression.sh
+
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Counts, versions and changelog agree
+        run: bash tests/metadata-consistency.sh
+
+  # The collector's whole purpose is to run on a booted Linux host, so CI runs it on one. This is
+  # the coverage that fixture tests cannot give: real /proc, real systemd, a real package database.
+  live-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run against the runner itself
+        run: |
+          S=plugins/linux-security-audit/skills/linux-security-audit/scripts/lsa-collect.sh
+          sudo bash "$S" --quick --passive > live.txt 2>live.err
+          echo "exit=$?"
+          tail -20 live.txt
+      - name: A run must produce checks and a summary
+        run: |
+          n=$(grep -c '^CHECK|' live.txt)
+          echo "checks emitted: $n"
+          [ "$n" -gt 200 ] || { echo "too few checks: $n"; exit 1; }
+          grep -q '^checks_total=' live.txt || { echo "no RUN_SUMMARY"; exit 1; }
+          grep -q '^===== END OF COLLECTION =====' live.txt || { echo "did not reach the end"; exit 1; }
+      - name: Records must be well formed
+        run: |
+          bad=$(grep '^CHECK|' live.txt | awk -F'|' 'NF != 6' | head -5)
+          [ -z "$bad" ] || { echo "malformed records:"; echo "$bad"; exit 1; }
+      - name: No check may report an empty verdict
+        run: |
+          bad=$(grep '^CHECK|' live.txt | awk -F'|' '$3 !~ /^(PASS|FAIL|WARN|INFO|NA)$/' | head -5)
+          [ -z "$bad" ] || { echo "bad verdicts:"; echo "$bad"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-collection
+          path: |
+            live.txt
+            live.err

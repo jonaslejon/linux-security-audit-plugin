@@ -66,21 +66,75 @@ OUT=""
 LSA_ROOT=""   # --root prefix; empty = live system
 OFFLINE=0
 
+die() { printf 'lsa-collect: %s\n' "$1" >&2; exit 2; }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --quick|--no-fs-scan) QUICK=1 ;;
     --no-probe|--passive) PROBE=0 ;;
     --apt-update) APTUPDATE=1 ;;
     --force) FORCE_NON_LINUX=1 ;;
-    --root) LSA_ROOT="${2%/}"; OFFLINE=1; PROBE=0; shift ;;
-    --out) OUT="$2"; shift ;;
+    # A missing or bad argument here used to leave LSA_ROOT empty with OFFLINE=1, which labels
+    # the report "OFFLINE" and then describes the running host. Silently auditing the wrong
+    # machine under an offline banner is the worst failure this tool has, so it is fatal.
+    --root)
+      [ -n "$2" ] || die "--root requires a path to a mounted filesystem"
+      case "$2" in -*) die "--root requires a path, got the flag '$2'" ;; esac
+      [ -d "$2" ] || die "--root: '$2' is not a directory"
+      LSA_ROOT="${2%/}"; OFFLINE=1; PROBE=0; shift ;;
+    --out)
+      [ -n "$2" ] || die "--out requires a filename"
+      OUT="$2"; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    # Unknown flags were ignored silently, so a typo'd --pasive left active probing ON and
+    # opened TLS handshakes and HTTP requests to production services with no warning.
+    *) die "unknown option '$1' (see --help). Refusing to run rather than fall back to defaults, because the default is to probe" ;;
   esac
   shift
 done
-[ -n "$OUT" ] && exec >"$OUT" 2>&1
+# stdout carries the machine-readable CHECK| contract. Merging stderr into it put stat and grep
+# warnings between the records and broke `grep '^CHECK|'`, so diagnostics go to a sidecar file.
+if [ -n "$OUT" ]; then
+  exec >"$OUT" 2>"${OUT}.stderr"
+fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
+# cap <n> — print at most n lines and SAY SO when there were more. `head -n` drops the remainder
+# without a trace, so a host with 213 SUID binaries reports 80 and reads as a complete list. That
+# is a missed finding dressed up as coverage, which is the same failure as a manufactured one:
+# the report claims to know something it does not. Truncations are counted into the run summary.
+cap() {
+  awk -v n="$1" -v tally="${LSA_TALLY:-}" '
+    { c++; if (c<=n) print }
+    END {
+      if (c>n) {
+        printf "  [truncated: showing %d of %d, re-run a targeted query for the rest]\n", n, c
+        if (tally != "") print "T 1" >> tally
+      }
+    }'
+}
+# redact_env — mask the VALUE of every assignment on a line, keeping the variable names.
+# A single `sed 's/=\([^=]*\)$/=<redacted>/'` only masks after the LAST '=', so a unit line
+# carrying two variables ("Environment=API_KEY=abc DB_SECRET=xyz") printed the first value
+# verbatim into the report. Redaction that is wrong on multi-assignment lines is worse than
+# no redaction, because the output claims to be safe to paste into a ticket.
+redact_env() {
+  awk '{
+    pfx=""
+    if (match($0, /^[[:space:]]*[A-Za-z_]+=/)) { pfx=substr($0,1,RLENGTH); $0=substr($0,RLENGTH+1) }
+    # A quoted value may contain spaces, so token-splitting cannot find where it ends. Rather
+    # than risk printing the tail of one, collapse the whole remainder. Losing a variable name
+    # is cheap; printing half a secret is not.
+    if ($0 ~ /[\047"]/) { sub(/=.*/, "=<redacted>", $0); print pfx $0; next }
+    line=$0; out=""
+    while (match(line, /[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*/)) {
+      tok=substr(line,RSTART,RLENGTH); eq=index(tok,"=")
+      out = out substr(line,1,RSTART-1) substr(tok,1,eq) "<redacted>"
+      line=substr(line,RSTART+RLENGTH)
+    }
+    print pfx out line
+  }'
+}
 # have_target <binary> — is it installed on the TARGET? Live that is the running PATH; offline it
 # must be looked for inside the mounted tree. `have` alone would resolve against the AUDITOR's PATH
 # and report their toolchain as the image's.
@@ -327,7 +381,7 @@ fi
 # End-of-life / very old kernels are their own finding; compare against distro current.
 if have needrestart; then
   raw "needrestart (reboot required?)"
-  run needrestart -b 2>/dev/null | head -30
+  run needrestart -b 2>/dev/null | cap 30
 fi
 if [ -f "$(rf /var/run/reboot-required)" ] || [ -f /run/reboot-required ]; then
   chk kernel.reboot_pending FAIL "yes" "kernel/libs updated but not rebooted — running code is not the patched code"
@@ -672,11 +726,11 @@ if have getenforce; then
 
   # --- unconfined domains: a process in an unconfined domain is NOT protected by policy ---
   raw "process security contexts (ps -eZ)"
-  run ps -eZ 2>/dev/null | head -60
+  run ps -eZ 2>/dev/null | cap 60
   raw "processes running in UNCONFINED domains"
   ps -eZ 2>/dev/null | awk 'NR>1' \
     | grep -E 'unconfined_t|unconfined_service_t|initrc_t|kernel_t\b' \
-    | grep -vE '\[' | head -40
+    | grep -vE '\[' | cap 40
   UNCONF="$(ps -eZ 2>/dev/null | awk 'NR>1' | grep -cE 'unconfined_t|unconfined_service_t|initrc_t')"
   if [ "${UNCONF:-0}" -gt 0 ]; then
     chk mac.selinux_unconfined FAIL "${UNCONF} process(es) in an unconfined domain" "SELinux is enforcing but these processes run under unconfined_t/unconfined_service_t/initrc_t, which permits essentially everything the DAC layer allows — for them SELinux provides no confinement at all. Confine each with a targeted policy module, or run it from a unit whose binary is labelled with a confined type"
@@ -684,12 +738,12 @@ if have getenforce; then
     chk mac.selinux_unconfined PASS "no unconfined domains running" ""
   fi
   raw "breakdown of running domains"
-  ps -eZ 2>/dev/null | awk 'NR>1{n=split($1,a,":"); print a[3]}' | sort | uniq -c | sort -rn | head -25
+  ps -eZ 2>/dev/null | awk 'NR>1{n=split($1,a,":"); print a[3]}' | sort | uniq -c | sort -rn | cap 25
 
   # --- permissive domains silently exempt themselves even when the system is Enforcing ---
   if have semanage; then
     raw "permissive domains (exempt from enforcement)"
-    run semanage permissive -l 2>/dev/null | head -20
+    run semanage permissive -l 2>/dev/null | cap 20
     PERMD="$(semanage permissive -l 2>/dev/null | grep -cE '^[a-z_]+_t$')"
     [ "${PERMD:-0}" -gt 0 ] && chk mac.selinux_permissive_domains FAIL "${PERMD} permissive domain(s)" "these domains are exempt from enforcement even though the system reports Enforcing — usually left over from troubleshooting"
   fi
@@ -697,12 +751,12 @@ if have getenforce; then
   [ "$AM_ROOT" = "1" ] && have ausearch && run ausearch -m AVC,USER_AVC -ts recent 2>/dev/null | tail -25
   [ "$AM_ROOT" = "1" ] && have journalctl && run journalctl -q --no-pager -n 15 -g 'avc:  denied' 2>/dev/null
   raw "booleans that weaken policy if on"
-  have getsebool && run getsebool -a 2>/dev/null | grep -E 'allow_execheap|allow_execmem|allow_execmod|allow_execstack|httpd_execmem|httpd_can_network_connect|httpd_enable_cgi|secure_mode_insmod|selinuxuser_execmod|domain_kernel_load_modules|nis_enabled' | head -20
+  have getsebool && run getsebool -a 2>/dev/null | grep -E 'allow_execheap|allow_execmem|allow_execmod|allow_execstack|httpd_execmem|httpd_can_network_connect|httpd_enable_cgi|secure_mode_insmod|selinuxuser_execmod|domain_kernel_load_modules|nis_enabled' | cap 20
   raw "file contexts pending relabel"
   [ -e /.autorelabel ] && echo "/.autorelabel present — filesystem relabel scheduled at next boot"
 elif have aa-status || [ -d /sys/kernel/security/apparmor ]; then
   raw "apparmor status"
-  if [ "$AM_ROOT" = "1" ] && have aa-status; then run aa-status; else cat /sys/kernel/security/apparmor/profiles 2>/dev/null | head -50; fi
+  if [ "$AM_ROOT" = "1" ] && have aa-status; then run aa-status; else cat /sys/kernel/security/apparmor/profiles 2>/dev/null | cap 50; fi
   ENF="$(grep -c '(enforce)' /sys/kernel/security/apparmor/profiles 2>/dev/null)"
   CMPL="$(grep -c '(complain)' /sys/kernel/security/apparmor/profiles 2>/dev/null)"
   if [ "${ENF:-0}" -gt 0 ]; then chk mac.apparmor PASS "${ENF} enforcing / ${CMPL:-0} complain" ""
@@ -711,7 +765,7 @@ elif have aa-status || [ -d /sys/kernel/security/apparmor ]; then
   # AppArmor's equivalent of "unconfined": a running process with no profile attached
   raw "processes and their AppArmor confinement"
   if [ "$AM_ROOT" = "1" ] && have aa-status; then
-    run aa-status 2>/dev/null | sed -n '/processes are in/,$p' | head -30
+    run aa-status 2>/dev/null | sed -n '/processes are in/,$p' | cap 30
     UNCONF="$(aa-status 2>/dev/null | awk '/processes are unconfined/{print $1; exit}')"
     [ -n "$UNCONF" ] && [ "$UNCONF" != "0" ] \
       && chk mac.apparmor_unconfined WARN "${UNCONF} unconfined process(es)" "these run with no AppArmor profile — on Ubuntu/Debian only a handful of daemons ship profiles, so custom applications are typically unconfined and get no MAC protection at all" \
@@ -730,7 +784,7 @@ elif have aa-status || [ -d /sys/kernel/security/apparmor ]; then
   if have ss; then
     ss -tulpnH 2>/dev/null | grep -vE '127\.0\.0\.1|\[::1\]' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | while read -r pid; do
       printf '  pid=%-7s %-28s %s\n' "$pid" "$(tr -d '\0' < "/proc/$pid/attr/current" 2>/dev/null)" "$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-50)"
-    done | head -20
+    done | cap 20
   fi
 elif [ -r "$(rf /etc/selinux/config)" ] || dir_readable "$(rf /etc/apparmor.d)"; then
   # tooling absent but configuration present — report the configuration, not "no MAC"
@@ -757,17 +811,19 @@ else
     [ -z "$SCANDIRS" ] && SCANDIRS="/"
   fi
   raw "SUID/SGID files"
+  _oifs=$IFS; IFS=$'\n'
   for d in $SCANDIRS; do
     find "$d" -xdev \( -perm -4000 -o -perm -2000 \) -type f -printf '%M %u %g %s %p\n' 2>/dev/null
   done | sort -u
+  IFS=$_oifs
   raw "file capabilities"
   if have getcap; then for d in $SCANDIRS; do getcap -r "$d" 2>/dev/null; done | sort -u; else echo "getcap not installed"; fi
   raw "world-writable directories missing sticky bit"
-  for d in $SCANDIRS; do find "$d" -xdev -type d -perm -0002 ! -perm -1000 -printf '%M %u %g %p\n' 2>/dev/null; done | head -50
+  for d in $SCANDIRS; do find "$d" -xdev -type d -perm -0002 ! -perm -1000 -printf '%M %u %g %p\n' 2>/dev/null; done | cap 50
   raw "world-writable files"
-  for d in $SCANDIRS; do find "$d" -xdev -type f -perm -0002 -printf '%M %u %g %p\n' 2>/dev/null; done | head -80
+  for d in $SCANDIRS; do find "$d" -xdev -type f -perm -0002 -printf '%M %u %g %p\n' 2>/dev/null; done | cap 80
   raw "files/dirs with no owner or no group"
-  for d in $SCANDIRS; do find "$d" -xdev \( -nouser -o -nogroup \) -printf '%M %u %g %p\n' 2>/dev/null; done | head -40
+  for d in $SCANDIRS; do find "$d" -xdev \( -nouser -o -nogroup \) -printf '%M %u %g %p\n' 2>/dev/null; done | cap 40
 fi
 
 # ------------------------------------------------------- 9. PERMISSIONS / UMASK
@@ -810,6 +866,7 @@ awk -F: '/^[^#]/ && NF>=7 && $3+0>=1000 && $3+0<65534 && $6!="" && $6!="/" && $6
 # counts in a second pass so they survive the subshell
 HOMES="$(awk -F: '/^[^#]/ && NF>=7 && $3+0>=1000 && $3+0<65534 && $6!="" && $6!="/" {print $6}' "$(rf /etc/passwd)" 2>/dev/null)"
 NOTHER=0; NGROUP=0; NTOT=0
+_oifs=$IFS; IFS=$'\n'
 for h in $HOMES; do
   hp="$(rf "$h")"; [ -d "$hp" ] || continue
   m="$(statmode "$hp")"; [ -z "$m" ] && continue
@@ -818,6 +875,7 @@ for h in $HOMES; do
   [ "$ot" != "0" ] && NOTHER=$((NOTHER+1))
   [ "$ot" = "0" ] && [ "$g" != "0" ] && NGROUP=$((NGROUP+1))
 done
+IFS=$_oifs
 if [ "$NTOT" = "0" ]; then
   chk perm.home_dirs NA "no home directories found or readable" "undetermined"
 elif [ "$NOTHER" -gt 0 ]; then
@@ -862,12 +920,14 @@ esac
 
 # ---- the sensitive subdirectories, regardless of the home's own mode ----
 raw "~/.ssh and dotfile directory permissions"
+_oifs=$IFS; IFS=$'\n'
 for h in $HOMES /root; do
   hp="$(rf "$h")"; [ -d "$hp/.ssh" ] || continue
   m="$(statmode "$hp/.ssh")"
   printf '  %s %s/.ssh\n' "${m:-?}" "$h"
   case "$m" in 700|0700) ;; ""|*) [ -n "$m" ] && chk "perm.ssh_dir$h" FAIL "$m $h/.ssh" "sshd refuses to use keys from a group- or world-writable .ssh, and a readable one exposes private keys and authorized_keys" ;; esac
 done
+IFS=$_oifs
 
 raw "critical file permissions"
 ls -l "$(rf /etc/passwd)" "$(rf /etc/shadow)" "$(rf /etc/gshadow)" "$(rf /etc/group)" "$(rf /etc/sudoers)" "$(rf /etc/ssh/sshd_config)" "$(rf /etc/crontab)" 2>/dev/null
@@ -898,8 +958,16 @@ stat -c '%a %n' /tmp "$(rf /var/tmp)" /dev/shm 2>/dev/null
 sec USERS_AUTH
 raw "UID 0 accounts"
 awk -F: '$3==0{print $1" shell="$7}' "$(rf /etc/passwd)" 2>/dev/null
-UID0="$(awk -F: '$3==0' "$(rf /etc/passwd)" 2>/dev/null | wc -l)"
-[ "${UID0:-0}" -gt 1 ] && chk users.uid0 FAIL "$UID0 accounts with UID 0" "only root should have UID 0" || chk users.uid0 PASS "1" ""
+UID0="$(awk -F: '$3==0' "$(rf /etc/passwd)" 2>/dev/null | wc -l | tr -d ' ')"
+if ! readable "$(rf /etc/passwd)"; then
+  chk users.uid0 NA "/etc/passwd not readable" "the UID-0 account count is not determinable without it; this is NOT a pass"
+elif [ "${UID0:-0}" -gt 1 ]; then
+  chk users.uid0 FAIL "$UID0 accounts with UID 0" "only root should have UID 0"
+elif [ "${UID0:-0}" -eq 0 ]; then
+  chk users.uid0 NA "no UID-0 account found in /etc/passwd" "a passwd file with no root entry means the read failed or the tree is incomplete, not that the host is hardened"
+else
+  chk users.uid0 PASS "1" ""
+fi
 raw "accounts with a login shell"
 awk -F: '$7 !~ /(nologin|false|sync|shutdown|halt)$/ {print $1":"$3":"$7}' "$(rf /etc/passwd)" 2>/dev/null
 
@@ -926,12 +994,23 @@ else
   chk users.missing_groups NA "group source is not local files" ""
 fi
 # the shadow group must be empty — membership grants read of /etc/shadow
-SHG="$(getent group shadow 2>/dev/null | cut -d: -f4)"
-[ -n "$SHG" ] && chk users.shadow_group FAIL "$SHG" "members of the shadow group can read every password hash" \
-              || chk users.shadow_group PASS "shadow group empty" ""
+if [ "$OFFLINE" = "1" ]; then
+  SHG_SEEN=0; readable "$(rf /etc/group)" && SHG_SEEN=1
+  SHG="$(awk -F: '$1=="shadow"{print $4}' "$(rf /etc/group)" 2>/dev/null)"
+else
+  SHG_SEEN=0; getent group >/dev/null 2>&1 && SHG_SEEN=1
+  SHG="$(getent group shadow 2>/dev/null | cut -d: -f4)"
+fi
+if [ "$SHG_SEEN" = "0" ]; then
+  chk users.shadow_group NA "group database not readable" "membership of the shadow group is not determinable here"
+elif [ -n "$SHG" ]; then
+  chk users.shadow_group FAIL "$SHG" "members of the shadow group can read every password hash"
+else
+  chk users.shadow_group PASS "shadow group empty or absent" ""
+fi
 if [ "$AM_ROOT" = "1" ]; then
-  have pwck && { raw "pwck -r"; run pwck -r 2>&1 | head -15; }
-  have grpck && { raw "grpck -r"; printf '' | run grpck -r 2>&1 | head -15; }
+  have pwck && { raw "pwck -r"; run pwck -r 2>&1 | cap 15; }
+  have grpck && { raw "grpck -r"; printf '' | run grpck -r 2>&1 | cap 15; }
 fi
 # home directories that do not exist or are not owned by their user
 raw "home directory ownership anomalies"
@@ -939,12 +1018,12 @@ awk -F: '/^[^#]/ && NF>=7 && $3+0>=1000 && $3+0<65534 {print $1" "$6}' "$(rf /et
   [ -d "$h" ] || { printf '  MISSING  %s (%s)\n' "$h" "$u"; continue; }
   o="$(stat -c '%U' "$h" 2>/dev/null)"
   [ "$o" = "$u" ] || printf '  NOT-OWNED-BY-USER %s owned by %s (user %s)\n' "$h" "$o" "$u"
-done | head -15
+done | cap 15
 # ---- CIS/STIG parity: parameter-level password policy, not just presence ----
 raw "PASSWORD POLICY PARAMETERS"
 PWQ="$( { cat "$(rf /etc/security/pwquality.conf)" 2>/dev/null; cat "$(rf /etc/security/pwquality.conf.d)"/*.conf 2>/dev/null;
           grep -RhsE 'pam_pwquality\.so|pam_cracklib\.so' "$(rf /etc/pam.d)" "$(rf /etc/authselect)" 2>/dev/null; } )"
-printf '%s\n' "$PWQ" | grep -vE '^\s*#|^\s*$' | head -20
+printf '%s\n' "$PWQ" | grep -vE '^\s*#|^\s*$' | cap 20
 pwq_get() { printf '%s\n' "$PWQ" | grep -oE "$1[[:space:]]*=[[:space:]]*-?[0-9]+" | tail -1 | grep -oE '\-?[0-9]+$'; }
 if [ -z "$PWQ" ]; then
   chk password.quality NA "no pwquality/cracklib configuration found or readable" "undetermined, not absent"
@@ -966,7 +1045,7 @@ fi
 raw "ACCOUNT LOCKOUT PARAMETERS"
 FLK="$( { cat "$(rf /etc/security/faillock.conf)" 2>/dev/null;
           grep -RhsE 'pam_faillock\.so|pam_tally2\.so' "$(rf /etc/pam.d)" "$(rf /etc/authselect)" 2>/dev/null; } )"
-printf '%s\n' "$FLK" | grep -vE '^\s*#|^\s*$' | head -12
+printf '%s\n' "$FLK" | grep -vE '^\s*#|^\s*$' | cap 12
 if [ -z "$FLK" ]; then
   chk lockout.configured FAIL "no pam_faillock/pam_tally2 configuration found" "failed logins are unlimited — password guessing is bounded only by network speed. Both CIS and STIG require lockout after a small number of failures"
 else
@@ -1019,7 +1098,7 @@ done
 [ -n "$PLUS" ] && chk users.legacy_plus FAIL "$PLUS" "legacy NIS '+' entries — historically these defer the file to a network map and on some implementations grant access to anyone the NIS server names" \
                || chk users.legacy_plus PASS "no legacy + entries" ""
 
-for b in /etc/issue /etc/issue.net /etc/motd; do
+for b in "$LSA_ROOT"/etc/issue "$LSA_ROOT"/etc/issue.net "$LSA_ROOT"/etc/motd; do
   f="$(rf $b)"
   if [ -r "$f" ]; then
     if grep -qiE '\\[smrvn]|Ubuntu [0-9]|Debian GNU|Red Hat|CentOS|kernel' "$f" 2>/dev/null; then
@@ -1219,7 +1298,7 @@ fi
 
 raw "SSH CLIENT forwarding defaults (outbound connections from this host)"
 SSHCLI="$( { cat "$(rf /etc/ssh/ssh_config)" 2>/dev/null; cat "$(rf /etc/ssh/ssh_config.d)"/*.conf 2>/dev/null; } | grep -vE '^\s*#|^\s*$')"
-printf '%s\n' "$SSHCLI" | grep -iE 'Forward(Agent|X11|X11Trusted)|StrictHostKeyChecking|UserKnownHostsFile|ControlMaster' | head -12
+printf '%s\n' "$SSHCLI" | grep -iE 'Forward(Agent|X11|X11Trusted)|StrictHostKeyChecking|UserKnownHostsFile|ControlMaster' | cap 12
 if [ -z "$SSHCLI" ]; then
   chk ssh.client_forwarding NA "no readable ssh_config" "client-side forwarding defaults not determinable"
 else
@@ -1240,7 +1319,7 @@ else
   raw "auth-relevant directives inside Match blocks"
   printf '%s\n' "$SSHCFG" | awk '/^[[:space:]]*Match /{inm=1; blk=$0; print "  "$0; next}
     inm && /^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PubkeyAuthentication|PermitRootLogin|AuthenticationMethods|AllowUsers|AllowGroups|PermitEmptyPasswords|AllowTcpForwarding|AllowAgentForwarding|X11Forwarding|GatewayPorts|PermitTunnel|AllowStreamLocalForwarding|PermitOpen|ForceCommand|ChrootDirectory)/ {print "      "$0}
-    inm && /^[[:space:]]*Match /{blk=$0}' | head -30
+    inm && /^[[:space:]]*Match /{blk=$0}' | cap 30
   REENABLE="$(printf '%s\n' "$SSHCFG" | awk '/^[[:space:]]*Match /{inm=1} inm && /^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AllowTcpForwarding|AllowAgentForwarding|X11Forwarding|GatewayPorts|PermitTunnel|AllowStreamLocalForwarding)[[:space:]]+(yes|all|point-to-point|ethernet)/{print}' | head -5)"
   if [ -n "$REENABLE" ]; then
     chk ssh.match_overrides FAIL "$(printf '%s' "$REENABLE" | tr '\n' ';' | cut -c1-160)" "a Match block RE-ENABLES password/keyboard-interactive authentication or a forwarding channel for some users, groups or source addresses. The global settings — and 'sshd -T' — do not show this, so a check that reads only the global config reports public-key-only while a password path is open. Verify per-context with: sshd -T -C user=<u>,host=<h>,addr=<a>"
@@ -1269,11 +1348,11 @@ if [ -r "$(rf /etc/ssh/moduli)" ]; then
                          || chk ssh.moduli PASS "0 weak of $TOT" ""
 else chk ssh.moduli NA "no /etc/ssh/moduli" ""; fi
 raw "host key fingerprints (must be unique per host)"
-for k in /etc/ssh/ssh_host_*_key.pub; do [ -r "$k" ] && ssh-keygen -lf "$k" 2>/dev/null; done
+for k in "$LSA_ROOT"/etc/ssh/ssh_host_*_key.pub; do [ -r "$k" ] && ssh-keygen -lf "$k" 2>/dev/null; done
 raw "host key file permissions"
 ls -l "$LSA_ROOT"/etc/ssh/ssh_host_*key 2>/dev/null
 raw "authorized_keys files + permissions"
-for d in /root /home/*; do
+for d in "$LSA_ROOT"/root "$LSA_ROOT"/home/*; do
   [ -f "$d/.ssh/authorized_keys" ] || continue
   ls -l "$d/.ssh/authorized_keys"
   awk '{print $1" "$2" ... "$NF}' "$d/.ssh/authorized_keys" 2>/dev/null
@@ -1305,7 +1384,7 @@ if have iptables && [ "$AM_ROOT" = "1" ]; then
     || [ "$(printf '%s\n' "$IPT6_OUT" | grep -cE '^-P [A-Z]+ (DROP|REJECT)')" -gt 0 ]; } && FW="$FW ip6tables"
 fi
 if have ufw; then raw "ufw status"; run ufw status verbose; ufw status 2>/dev/null | grep -qi '^Status: active' && FW="$FW ufw"; fi
-if have firewall-cmd; then raw "firewalld"; run firewall-cmd --state; run firewall-cmd --list-all-zones | head -80; firewall-cmd --state 2>/dev/null | grep -q running && FW="$FW firewalld"; fi
+if have firewall-cmd; then raw "firewalld"; run firewall-cmd --state; run firewall-cmd --list-all-zones | cap 80; firewall-cmd --state 2>/dev/null | grep -q running && FW="$FW firewalld"; fi
 have systemctl && { raw "firewall services"; run systemctl is-active nftables firewalld ufw iptables 2>/dev/null; }
 FW="$(printf '%s' "$FW" | sed 's/^ *//')"
 if [ "$AM_ROOT" != "1" ]; then
@@ -1324,7 +1403,7 @@ else
   IPT_POL="$(iptables -S 2>/dev/null | grep '^-P')"
   NFT_ALL="$(nft list ruleset 2>/dev/null)"
   printf '%s\n' "$IPT_POL"
-  printf '%s\n' "$NFT_ALL" | grep -E 'chain (input|output|forward)|type filter hook' | head -12
+  printf '%s\n' "$NFT_ALL" | grep -E 'chain (input|output|forward)|type filter hook' | cap 12
   UFW_DEF="$(grep -hE '^DEFAULT_(INPUT|OUTPUT|FORWARD)_POLICY' "$(rf /etc/default/ufw)" 2>/dev/null)"
   [ -n "$UFW_DEF" ] && printf '%s\n' "$UFW_DEF"
 
@@ -1356,7 +1435,7 @@ else
     DROP|REJECT|drop|deny)
       chk firewall.policy_output PASS "OUTPUT=$POUT" "default-deny egress — the control that turns a code-execution bug into a dead end"
       raw "explicitly permitted egress"
-      printf '%s\n' "$(iptables -S OUTPUT 2>/dev/null | grep -vE '^-P')" | head -25
+      printf '%s\n' "$(iptables -S OUTPUT 2>/dev/null | grep -vE '^-P')" | cap 25
       ;;
     "") chk firewall.policy_output NA "OUTPUT policy not determined" "" ;;
     *)  chk firewall.policy_output FAIL "OUTPUT=$POUT" "UNRESTRICTED EGRESS. Inbound filtering only stops the first step; with open egress a compromised process can reach any C2 endpoint, exfiltrate to any destination, pull a second stage, and open a reverse shell outbound through the firewall you do have. Egress filtering is what makes an initial foothold non-monetisable. Start with: allow DNS to your resolvers, NTP to your servers, HTTPS to your package mirrors and monitored endpoints, then default-deny with logging and read the log for a week before enforcing" ;;
@@ -1365,8 +1444,8 @@ else
   [ "${EGRESS_RULES:-0}" = "0" ] && [ -n "$POUT" ] && \
     chk firewall.egress_rules WARN "no OUTPUT rules at all" "egress is entirely unfiltered; not even DNS/NTP/HTTPS are scoped to known destinations"
   raw "outbound rules referencing specific destinations (scoped egress is the goal)"
-  iptables -S OUTPUT 2>/dev/null | grep -E '\-d |dport' | head -15
-  printf '%s\n' "$NFT_ALL" | grep -A20 'hook output' | grep -E 'daddr|dport' | head -15
+  iptables -S OUTPUT 2>/dev/null | grep -E '\-d |dport' | cap 15
+  printf '%s\n' "$NFT_ALL" | grep -A20 'hook output' | grep -E 'daddr|dport' | cap 15
 
   # ---- do the opened ports correspond to anything actually listening? ----
   raw "FIREWALL/LISTENER RECONCILIATION"
@@ -1465,7 +1544,7 @@ NIFS="$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2}' | sort -u
 NIFCOUNT="$(printf '%s' "$NIFS" | wc -w | tr -d ' ')"
 printf '  global interfaces (%s): %s\n' "${NIFCOUNT:-?}" "${NIFS:-unknown}"
 WILDCARD="$(ss -tulpnH 2>/dev/null | awk '$5 ~ /^(0\.0\.0\.0|\[::\])/ {print $1" "$5" "$NF}')"
-printf '%s\n' "$WILDCARD" | grep -v '^$' | sed 's/^/  /' | head -25
+printf '%s\n' "$WILDCARD" | grep -v '^$' | sed 's/^/  /' | cap 25
 NWILD="$(printf '%s' "$WILDCARD" | grep -c .)"
 if offline_na net.bind_address "listening sockets"; then :
 elif ! have ss; then
@@ -1504,15 +1583,15 @@ have systemctl && run systemctl list-unit-files --type=service --state=enabled -
 raw "failed units"
 have systemctl && run systemctl --failed --no-pager --no-legend
 raw "systemd-analyze security (sandboxing exposure per unit; lower is better)"
-have systemd-analyze && run systemd-analyze security --no-pager 2>/dev/null | head -60
+have systemd-analyze && run systemd-analyze security --no-pager 2>/dev/null | cap 60
 # ---- root-process audit: every process should run as the least-privileged user that works ----
 raw "PROCESS PRIVILEGE AUDIT"
 raw "process count by user"
-ps -eo user= 2>/dev/null | sort | uniq -c | sort -rn | head -20
+ps -eo user= 2>/dev/null | sort | uniq -c | sort -rn | cap 20
 
 # kernel threads (ppid 2 or bracketed comm) are root by definition and are not findings
 raw "non-kernel processes running as root"
-ps -eo user,pid,ppid,args 2>/dev/null | awk '$1=="root" && $3!=2 && $2!=2 && $4 !~ /^\[/' | head -80
+ps -eo user,pid,ppid,args 2>/dev/null | awk '$1=="root" && $3!=2 && $2!=2 && $4 !~ /^\[/' | cap 80
 
 NROOT="$(ps -eo user,pid,ppid,args 2>/dev/null | awk '$1=="root" && $3!=2 && $2!=2 && $4 !~ /^\[/' | grep -vc '^USER')"
 NTOT="$(ps -eo user= 2>/dev/null | grep -vc '^$')"
@@ -1523,7 +1602,7 @@ ROOT_EXPECTED='systemd|systemd-journald|systemd-udevd|systemd-logind|systemd-net
 raw "root processes that are NOT standard root infrastructure (review each for a least-privilege user)"
 ps -eo user,pid,args 2>/dev/null \
   | awk '$1=="root" && $3 !~ /^\[/' \
-  | grep -vE "$ROOT_EXPECTED" | head -40
+  | grep -vE "$ROOT_EXPECTED" | cap 40
 UNEXP="$(ps -eo user,pid,args 2>/dev/null | awk '$1=="root" && $3 !~ /^\[/' | grep -vcE "$ROOT_EXPECTED")"
 [ "${UNEXP:-0}" -gt 0 ] && chk proc.root_unexpected WARN "${UNEXP} process(es)" "application-level daemons running as root — each should run under a dedicated service account unless it needs a root-only capability (binding <1024 can use CAP_NET_BIND_SERVICE or a systemd socket instead)" \
                         || chk proc.root_unexpected PASS "only standard root infrastructure" ""
@@ -1536,7 +1615,7 @@ if have ss; then
     [ -n "$pid" ] || continue
     u="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')"
     [ "$u" = "root" ] && printf '  %s  %s\n' "$(printf '%s' "$l" | awk '{print $1" "$5}')" "$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-70)"
-  done | sort -u | head -25
+  done | sort -u | cap 25
   NRL="$(ss -tulpnH 2>/dev/null | grep -vE '127\.0\.0\.1|\[::1\]' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | while read -r pid; do ps -o user= -p "$pid" 2>/dev/null | tr -d ' '; done | grep -c '^root$')"
   [ "${NRL:-0}" -gt 0 ] && chk proc.root_listeners WARN "${NRL}" "root-owned process(es) listening on a non-loopback address — a remote bug in any of them is immediate root. Drop privileges after bind, or use systemd socket activation with User=" \
                         || chk proc.root_listeners PASS "no root-owned public listeners" ""
@@ -1550,7 +1629,7 @@ if have systemctl; then
     US="$(systemctl show "$u" -p User --value 2>/dev/null)"
     DP="$(systemctl show "$u" -p DynamicUser --value 2>/dev/null)"
     if [ -z "$US" ] && [ "$DP" != "yes" ]; then printf '  %s\n' "$u"; fi
-  done | head -40
+  done | cap 40
   NOUSER="$(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print $1}' | while read -r u; do
     [ -n "$u" ] || continue
     [ -z "$(systemctl show "$u" -p User --value 2>/dev/null)" ] && [ "$(systemctl show "$u" -p DynamicUser --value 2>/dev/null)" != "yes" ] && echo x
@@ -1566,7 +1645,7 @@ for pid in $(ps -eo pid,user 2>/dev/null | awk '$2=="root"{print $1}' | head -25
   nnp="$(awk '/^NoNewPrivs/{print $2}' "/proc/$pid/status" 2>/dev/null)"
   cm="$(tr -d '\0' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-50)"
   [ -n "$ce" ] && printf '  pid=%-7s CapEff=%-18s NoNewPrivs=%s  %s\n' "$pid" "$ce" "${nnp:-?}" "${cm:-?}"
-done 2>/dev/null | head -25
+done 2>/dev/null | cap 25
 have capsh && echo "(decode with: capsh --decode=<CapEff>)"
 raw "listening processes not owned by root (good) vs root (review)"
 have ss && ss -tulpnH 2>/dev/null | grep -oE 'users:\(\("[^"]+"' | sort | uniq -c | sort -rn
@@ -1608,7 +1687,7 @@ if [ -n "$WS" ]; then
   raw "web server config ownership and permissions"
   WEBUSER="$(ps -eo user,args 2>/dev/null | grep -E 'nginx: worker|apache2 -k|httpd -D|php-fpm: pool' | grep -v grep | awk '{print $1}' | grep -v '^root$' | sort -u | head -1)"
   printf '  worker user: %s\n' "${WEBUSER:-unknown}"
-  for cd in /etc/nginx /etc/apache2 /etc/httpd /etc/php; do
+  for cd in "$LSA_ROOT"/etc/nginx "$LSA_ROOT"/etc/apache2 "$LSA_ROOT"/etc/httpd "$LSA_ROOT"/etc/php; do
     [ -d "$cd" ] || continue
     stat -c '  %a %U:%G %n' "$cd" 2>/dev/null
     BADCFG="$(find "$cd" -maxdepth 3 ! -type l \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | head -15)"
@@ -1624,7 +1703,7 @@ if [ -n "$WS" ]; then
     fi
   done
   raw "private keys readable by the worker user"
-  [ -n "$WEBUSER" ] && for k in /etc/ssl/private/* /etc/pki/tls/private/* /etc/letsencrypt/live/*/privkey.pem; do
+  [ -n "$WEBUSER" ] && for k in "$LSA_ROOT"/etc/ssl/private/* "$LSA_ROOT"/etc/pki/tls/private/* "$LSA_ROOT"/etc/letsencrypt/live/*/privkey.pem; do
     [ -f "$k" ] || continue
     stat -c '  %a %U:%G %n' "$k" 2>/dev/null
   done
@@ -1634,6 +1713,7 @@ if [ -n "$WS" ]; then
   raw ".htaccess / .user.ini files and their security-relevant directives"
   HTFILES="$(find "$(rf /var/www)" "$(rf /srv/www)" "$(rf /usr/share/nginx)" "$(rf /opt)" -maxdepth 6 \( -name '.htaccess' -o -name '.user.ini' -o -name '.htpasswd' \) -print 2>/dev/null | head -40)"
   [ -n "$HTFILES" ] && printf '%s\n' "$HTFILES" | tr '\n' '\0' | xargs -0 ls -l 2>/dev/null
+  _oifs=$IFS; IFS=$'\n'
   for h in $HTFILES; do
     case "$h" in
       *.htpasswd)
@@ -1677,11 +1757,12 @@ if [ -n "$WS" ]; then
     printf '%s' "$HC" | grep -qiE '^\s*ErrorDocument[^\n]*\.(php|cgi|pl)' \
       && chk "htaccess.errordocument$hid" INFO "$(printf '%s' "$HC" | grep -iE '^\s*ErrorDocument' | head -1)" "error handler invokes a script — reachable by forcing an error"
   done
+  IFS=$_oifs
   [ -n "$HTFILES" ] && chk htaccess.count INFO "$(printf '%s' "$HTFILES" | grep -c .) file(s)" "each is server configuration living inside the writable served tree; with AllowOverride None they are inert — check that first"
 
   runtime_on
   raw "worker processes and their user (workers must not run as root)"
-  ps -eo user,pid,args 2>/dev/null | grep -E '(nginx|apache2|httpd|caddy|php-fpm|haproxy)' | grep -v grep | head -25
+  ps -eo user,pid,args 2>/dev/null | grep -E '(nginx|apache2|httpd|caddy|php-fpm|haproxy)' | grep -v grep | cap 25
   WROOT="$(ps -eo user,args 2>/dev/null | grep -E '(nginx: worker|apache2 |httpd |php-fpm: pool)' | grep -v grep | awk '$1=="root"' | wc -l)"
   [ "${WROOT:-0}" -gt 0 ] && chk web.worker_user WARN "$WROOT worker/pool process(es) as root" "only the master should be root; workers must drop privileges" \
                           || chk web.worker_user PASS "workers not running as root" ""
@@ -1693,7 +1774,7 @@ if [ -d "$(rf /etc/nginx)" ] || have nginx; then
   have nginx && run nginx -t
   raw "nginx effective config (nginx -T)"
   if [ "$AM_ROOT" = "1" ] && have nginx; then NGX="$(nginx -T 2>/dev/null)"; else NGX="$(grep -rhvE '^\s*#|^\s*$' "$(rf /etc/nginx/)" 2>/dev/null)"; fi
-  printf '%s\n' "$NGX" | grep -vE '^\s*#' | grep -vE '^\s*$' | head -400
+  printf '%s\n' "$NGX" | grep -vE '^\s*#' | grep -vE '^\s*$' | cap 400
 
   ngx_has() { printf '%s' "$NGX" | grep -qiE "$1"; }
   ngx_has '^\s*server_tokens\s+off' && chk nginx.server_tokens PASS "off" "" \
@@ -1719,9 +1800,9 @@ if [ -d "$(rf /etc/nginx)" ] || have nginx; then
   printf '%s' "$NGX" | grep -qiE 'fastcgi_split_path_info|SCRIPT_FILENAME\s+\$document_root\$fastcgi_script_name' && \
     { printf '%s' "$NGX" | grep -qi 'try_files.*\$uri.*=404\|fastcgi_param\s*PHP_VALUE' || chk nginx.php_pathinfo WARN "fastcgi without a try_files =404 guard" "classic arbitrary-PHP-execution misconfiguration (uploads served as PHP)"; }
   raw "nginx: proxy_pass targets and any open-proxy shaped config"
-  printf '%s\n' "$NGX" | grep -iE '^\s*proxy_pass' | sort -u | head -20
+  printf '%s\n' "$NGX" | grep -iE '^\s*proxy_pass' | sort -u | cap 20
   raw "nginx: server_name / listen directives"
-  printf '%s\n' "$NGX" | grep -iE '^\s*(listen|server_name|root|ssl_certificate\b|ssl_certificate_key)' | sort -u | head -60
+  printf '%s\n' "$NGX" | grep -iE '^\s*(listen|server_name|root|ssl_certificate\b|ssl_certificate_key)' | sort -u | cap 60
   raw "nginx: locations exposing status/metrics"
   printf '%s\n' "$NGX" | grep -iE 'stub_status|/nginx_status|/server-status|/metrics' | head
 
@@ -1769,10 +1850,10 @@ stream~--with-stream ngx_stream_module~^[[:space:]]*stream[[:space:]]*\\{~generi
     fi
   done
   raw "nginx log config (missing access log = no forensics)"
-  printf '%s\n' "$NGX" | grep -iE '^\s*(access_log|error_log)' | sort -u | head -20
+  printf '%s\n' "$NGX" | grep -iE '^\s*(access_log|error_log)' | sort -u | cap 20
   printf '%s' "$NGX" | grep -qiE '^\s*access_log\s+off' && chk nginx.access_log WARN "access_log off somewhere" "no request record for incident response"
   raw "real-client-IP handling behind a CDN/proxy"
-  printf '%s\n' "$NGX" | grep -iE 'real_ip_header|set_real_ip_from' | sort -u | head -20
+  printf '%s\n' "$NGX" | grep -iE 'real_ip_header|set_real_ip_from' | sort -u | cap 20
   if printf '%s' "$NGX" | grep -qi 'real_ip_header' && ! printf '%s' "$NGX" | grep -qi 'set_real_ip_from'; then
     chk nginx.real_ip FAIL "real_ip_header without set_real_ip_from" "any client can forge its source IP, defeating rate limits, allowlists and fail2ban"
   fi
@@ -1859,7 +1940,7 @@ ssl_module~SSLEngine~(needed for TLS)'
   ls "$(rf /etc/httpd/conf.modules.d/)" 2>/dev/null
   APC="$(grep -rhvE '^\s*#|^\s*$' "$(rf /etc/apache2/)" "$(rf /etc/httpd/)" 2>/dev/null)"
   raw "apache security-relevant directives"
-  printf '%s\n' "$APC" | grep -iE '^\s*(ServerTokens|ServerSignature|TraceEnable|Options|AllowOverride|Require|Order|Allow|Deny|Header\s+(always\s+)?set|SSLProtocol|SSLCipherSuite|SSLHonorCipherOrder|SSLUseStapling|Timeout|KeepAliveTimeout|LimitRequestBody|LimitRequestFields|FileETag|ServerName|DocumentRoot|User|Group)' | sort -u | head -80
+  printf '%s\n' "$APC" | grep -iE '^\s*(ServerTokens|ServerSignature|TraceEnable|Options|AllowOverride|Require|Order|Allow|Deny|Header\s+(always\s+)?set|SSLProtocol|SSLCipherSuite|SSLHonorCipherOrder|SSLUseStapling|Timeout|KeepAliveTimeout|LimitRequestBody|LimitRequestFields|FileETag|ServerName|DocumentRoot|User|Group)' | sort -u | cap 80
   if [ -z "$APC" ]; then
     chk apache.config_readable NA "apache is present but no config content was read" "the config tree could not be read (permissions, or a non-standard ServerRoot). Every apache.* directive check would otherwise report the BUILT-IN DEFAULT as though it were the configured value — suppressed instead"
   else
@@ -1881,14 +1962,15 @@ ssl_module~SSLEngine~(needed for TLS)'
   fi
   fi
   raw "apache <Directory /> default policy (should deny)"
-  grep -rhA5 '<Directory */ *>' "$(rf /etc/apache2/apache2.conf)" "$(rf /etc/httpd/conf/httpd.conf)" 2>/dev/null | head -20
+  grep -rhA5 '<Directory */ *>' "$(rf /etc/apache2/apache2.conf)" "$(rf /etc/httpd/conf/httpd.conf)" 2>/dev/null | cap 20
   raw "apache status/info endpoints"
-  printf '%s\n' "$APC" | grep -iB2 -A4 'server-status\|server-info' | head -30
+  printf '%s\n' "$APC" | grep -iB2 -A4 'server-status\|server-info' | cap 30
 fi
 
 # ---- TLS certificates ----
 raw "TLS certificates found in web config (expiry + key permissions)"
 CERTS="$( { printf '%s\n' "${NGX:-}" ; printf '%s\n' "${APC:-}" ; } 2>/dev/null | grep -ioE '(ssl_certificate|SSLCertificateFile|SSLCertificateKeyFile|ssl_certificate_key)\s+[^;[:space:]]+' | awk '{print $2}' | sort -u)"
+_oifs=$IFS; IFS=$'\n'
 for c in $CERTS; do
   [ -r "$c" ] || { printf 'UNREADABLE %s\n' "$c"; continue; }
   case "$c" in
@@ -1904,6 +1986,7 @@ for c in $CERTS; do
        fi ;;
   esac
 done
+IFS=$_oifs
 
 # ---- webroot exposure ----
 raw "document roots"
@@ -1931,6 +2014,7 @@ printf '%s' "${NGX:-}${APC:-}" | grep -qiE 'fastcgi_pass|SetHandler[^\n]*php|Add
 have php && [ "$PHP_ACTIVE" = "0" ] && PHP_ACTIVE=1
 
 TOTAL_WDIR=0; TOTAL_WPHP=0
+_oifs=$IFS; IFS=$'\n'
 for d in $DOCROOTS; do
   [ -d "$d" ] || continue
   printf '\n[%s] owner/mode: %s\n' "$d" "$(stat -c '%a %U:%G' "$d" 2>/dev/null)"
@@ -1991,6 +2075,7 @@ for d in $DOCROOTS; do
     chk webroot.writable_htaccess FAIL "$(printf '%s' "$WHT" | tr '\n' ' ' | cut -c1-140)" "a writable .htaccess lets the web process change server behaviour — re-enable the PHP handler in an upload directory, set a new handler, or disable an access restriction. With AllowOverride All this is equivalent to editing the vhost"
   fi
 done
+IFS=$_oifs
 
 if [ "${TOTAL_WPHP:-0}" -gt 0 ]; then
   chk webroot.writable_php FAIL "${TOTAL_WPHP} PHP file(s) writable by ${WWWUSER:-the worker}" "existing application code can be modified in place by the process serving requests — no upload bug required, and the change survives as a webshell. Application code should be owned by a deploy user and read-only to the worker"
@@ -2075,7 +2160,7 @@ pdo_mysql|MySQL client via PDO'
   EXTCOUNT="$(printf '%s\n' "$PHPM" | grep -vc '^\[' )"
   chk php.extension_count INFO "${EXTCOUNT:-?} extensions loaded" "each is C code parsing attacker-controlled input in every request; disable what the application does not call"
   raw "where extensions are enabled"
-  ls "$LSA_ROOT"/etc/php/*/mods-available/ "$(rf /etc/php.d/)" 2>/dev/null | head -30
+  ls "$LSA_ROOT"/etc/php/*/mods-available/ "$(rf /etc/php.d/)" 2>/dev/null | cap 30
 fi
 
 # ---- live response headers (loopback only, never leaves the host) ----
@@ -2086,7 +2171,7 @@ if [ "$PROBE" = "1" ] && have curl && { [ -n "$WS" ] || [ "$HTTP_LISTENING" = "1
   raw "live response headers from localhost (http/https)"
   for u in http://127.0.0.1/ https://127.0.0.1/; do
     printf '\n>>> %s\n' "$u"
-    run curl -skI --max-time 6 "$u" | head -25
+    run curl -skI --max-time 6 "$u" | cap 25
   done
   HDRS="$(curl -skI --max-time 6 https://127.0.0.1/ 2>/dev/null; curl -skI --max-time 6 http://127.0.0.1/ 2>/dev/null)"
   for h in "Strict-Transport-Security" "X-Content-Type-Options" "X-Frame-Options" "Content-Security-Policy" "Referrer-Policy"; do
@@ -2184,7 +2269,7 @@ for p in $TLS_PORTS; do
   SCOPE="$(is_internal_addr "${BIND:-127.0.0.1}")"
 
   raw "TLS endpoint 127.0.0.1:$p (bind=${BIND:-?} scope=$SCOPE)"
-  printf '%s\n' "$HS" | grep -E '^\s*(Protocol|Cipher|Server public key|Peer signature type|Negotiated TLS1.3 group|Verify return code|subject=|issuer=)' | head -12
+  printf '%s\n' "$HS" | grep -E '^\s*(Protocol|Cipher|Server public key|Peer signature type|Negotiated TLS1.3 group|Verify return code|subject=|issuer=)' | cap 12
 
   NEGO_P="$(tls_field "$HS" Protocol)"
   NEGO_C="$(tls_field "$HS" Cipher)"
@@ -2280,7 +2365,7 @@ for p in $TLS_PORTS; do
       chk "tls.$p.mtls" WARN "requested but NOT enforced" "the server asks for a client certificate yet completed the handshake without one — permissive/optional mTLS authenticates nobody unless the application separately rejects unverified peers (nginx \$ssl_client_verify, Apache SSLVerifyClient require)"
     fi
     raw "accepted client CA names for port $p"
-    printf '%s\n' "$HS" | sed -n '/Acceptable client certificate CA names/,/^---/p' | head -10
+    printf '%s\n' "$HS" | sed -n '/Acceptable client certificate CA names/,/^---/p' | cap 10
   else
     case "$SCOPE" in
       loopback)
@@ -2412,7 +2497,7 @@ if [ -n "$PGC" ]; then
   raw "postgresql TLS"
   grep -hE '^\s*(ssl|ssl_ca_file|ssl_cert_file|ssl_ciphers|ssl_min_protocol_version|ssl_prefer_server_ciphers)' "$PGC" 2>/dev/null
   PGHBA="$(dirname "$PGC")/pg_hba.conf"
-  [ -r "$PGHBA" ] && { raw "pg_hba.conf (hostssl + clientcert)"; grep -vE '^\s*#|^\s*$' "$PGHBA" | head -20; }
+  [ -r "$PGHBA" ] && { raw "pg_hba.conf (hostssl + clientcert)"; grep -vE '^\s*#|^\s*$' "$PGHBA" | cap 20; }
   if [ -r "$PGHBA" ]; then
     grep -qE '^\s*hostssl.*clientcert\s*=\s*verify-full' "$PGHBA" 2>/dev/null \
       && chk mtls.postgres PASS "hostssl clientcert=verify-full" "" \
@@ -2476,7 +2561,7 @@ INSECURE_RE='curl[^|]*(-k|--insecure)|wget[^|]*--no-check-certificate|NODE_TLS_R
 CANDFILES="$(tmo 30 find "$(rf /etc/cron.d)" "$(rf /etc/cron.daily)" "$(rf /etc/cron.hourly)" "$(rf /etc/cron.weekly)" "$(rf /etc/cron.monthly)" \
       /etc/systemd/system /etc/profile.d /usr/local/bin /usr/local/sbin /opt \
       -maxdepth 3 -type f -size -256k 2>/dev/null | head -500)"
-for f in /etc/crontab /etc/environment /root/.curlrc /etc/curlrc /root/.wgetrc /etc/wgetrc /etc/gitconfig /root/.gitconfig; do
+for f in "$LSA_ROOT"/etc/crontab "$LSA_ROOT"/etc/environment "$LSA_ROOT"/root/.curlrc "$LSA_ROOT"/etc/curlrc "$LSA_ROOT"/root/.wgetrc "$LSA_ROOT"/etc/wgetrc "$LSA_ROOT"/etc/gitconfig "$LSA_ROOT"/root/.gitconfig; do
   [ -f "$f" ] && CANDFILES="$CANDFILES
 $f"
 done
@@ -2507,7 +2592,7 @@ if have dpkg-query; then
   raw "package count"; dpkg-query -f '${binary:Package}\n' -W 2>/dev/null | wc -l
   raw "manually installed packages"; have apt-mark && run apt-mark showmanual | tr '\n' ' '
   echo
-  raw "pending updates"; run apt-get -s upgrade 2>/dev/null | grep -E '^Inst' | head -60
+  raw "pending updates"; run apt-get -s upgrade 2>/dev/null | grep -E '^Inst' | cap 60
   PEND="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst')"
   SECU="$(apt-get -s upgrade 2>/dev/null | grep '^Inst' | grep -ci 'security')"
   [ "${SECU:-0}" -gt 0 ] && chk packages.security_updates FAIL "$SECU pending" "known-vulnerable packages installed" \
@@ -2520,14 +2605,14 @@ if have dpkg-query; then
   grep -rhE '^\s*(deb|URIs)' "$(rf /etc/apt/sources.list)" "$(rf /etc/apt/sources.list.d/)" 2>/dev/null | grep -c 'http://' | sed 's/^/http_sources=/'
   raw "apt sandbox"
   grep -rhs 'Sandbox' "$(rf /etc/apt/apt.conf.d/)" 2>/dev/null
-  have debsecan && { raw "debsecan (known CVEs)"; run debsecan --suite "$(lsb_release -cs 2>/dev/null)" --format summary 2>/dev/null | head -30; }
+  have debsecan && { raw "debsecan (known CVEs)"; run debsecan --suite "$(lsb_release -cs 2>/dev/null)" --format summary 2>/dev/null | cap 30; }
 elif have rpm; then
   raw "package count"; rpm -qa 2>/dev/null | wc -l
   raw "installed packages"; rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort | tr '\n' ' '
   echo
   raw "pending security updates"
-  have dnf && run dnf -q updateinfo list security 2>/dev/null | head -40
-  have yum && ! have dnf && run yum -q updateinfo list security 2>/dev/null | head -40
+  have dnf && run dnf -q updateinfo list security 2>/dev/null | cap 40
+  have yum && ! have dnf && run yum -q updateinfo list security 2>/dev/null | cap 40
   # full verification runs once, in the INTEGRITY section — not duplicated here
   raw "automatic updates"
   have systemctl && run systemctl is-enabled dnf-automatic.timer yum-cron 2>/dev/null
@@ -2665,7 +2750,7 @@ if [ -d "$(rf /etc/apt)" ]; then
   fi
   raw "keys and expiry"
   if have gpg; then
-    for kr in /etc/apt/trusted.gpg /etc/apt/trusted.gpg.d/*.gpg /etc/apt/keyrings/*.gpg /etc/apt/keyrings/*.asc; do
+    for kr in "$LSA_ROOT"/etc/apt/trusted.gpg "$LSA_ROOT"/etc/apt/trusted.gpg.d/*.gpg "$LSA_ROOT"/etc/apt/keyrings/*.gpg "$LSA_ROOT"/etc/apt/keyrings/*.asc; do
       [ -s "$kr" ] || continue
       printf '\n[%s]\n' "$kr"
       gpg --no-default-keyring --keyring "$kr" --list-keys --with-colons 2>/dev/null \
@@ -2674,7 +2759,7 @@ if [ -d "$(rf /etc/apt)" ]; then
   fi
   raw "sources using plaintext http"
   APTHTTP="$(grep -rhE '^\s*(deb|deb-src)\s+(\[[^]]*\]\s+)?http://|^\s*URIs:\s*http://' "$(rf /etc/apt/sources.list)" "$(rf /etc/apt/sources.list.d/)" 2>/dev/null)"
-  printf '%s\n' "$APTHTTP" | head -20
+  printf '%s\n' "$APTHTTP" | cap 20
   NHTTP="$(printf '%s' "$APTHTTP" | grep -c .)"
   if [ "${NHTTP:-0}" -gt 0 ]; then
     chk repo.apt_http FAIL "${NHTTP} source(s) over plaintext http://" "package signatures protect integrity, so this is not remote code execution on its own — but plaintext still lets an on-path observer read your EXACT package and version inventory (a ready-made list of which CVEs apply to this host), and lets them mount freeze/replay attacks by serving a stale Release file to withhold security updates until Valid-Until expires. Every major distro serves HTTPS; switch the URIs"
@@ -2687,7 +2772,7 @@ if [ -d "$(rf /etc/apt)" ]; then
   # check is worth the cache refresh.
   if [ "$APTUPDATE" = "1" ] && [ "$AM_ROOT" = "1" ] && have apt-get; then
     active_on
-    run apt-get -o Debug::NoLocking=1 -qq update 2>&1 | grep -iE 'NO_PUBKEY|not signed|InRelease|signature|EXPKEYSIG|Insufficient' | head -10
+    run apt-get -o Debug::NoLocking=1 -qq update 2>&1 | grep -iE 'NO_PUBKEY|not signed|InRelease|signature|EXPKEYSIG|Insufficient' | cap 10
     active_off
   else
     chk repo.apt_signature_selftest NA "not run" "verifying that every repo is signed requires 'apt-get update', which refreshes /var/lib/apt/lists. Pass --apt-update to include it; otherwise this is inferred from configuration only"
@@ -2703,7 +2788,7 @@ if have apk; then
 fi
 if have zypper; then
   raw "zypper repositories (gpgcheck per repo)"
-  run zypper --non-interactive lr -d 2>/dev/null | head -40
+  run zypper --non-interactive lr -d 2>/dev/null | cap 40
 fi
 raw "language package managers pulling code at build/run time"
 ls "$(rf /etc/pip.conf)" ~/.pip/pip.conf "$(rf /etc/npmrc)" ~/.npmrc "$(rf /etc/gemrc)" 2>/dev/null
@@ -2751,7 +2836,7 @@ if have apt-cache && have dpkg-query; then
     chk packages.orphaned PASS "every installed package has a repository candidate" ""
   fi
   raw "packages held back from upgrades"
-  apt-mark showhold 2>/dev/null | head -10
+  apt-mark showhold 2>/dev/null | cap 10
   HELD="$(apt-mark showhold 2>/dev/null | wc -l | tr -d ' ')"
   [ "${HELD:-0}" -gt 0 ] && chk packages.held WARN "${HELD} package(s) on hold" "held packages are excluded from security updates — confirm each hold is still justified"
 elif have dnf; then
@@ -2759,7 +2844,7 @@ elif have dnf; then
   # Run once and reuse: the second, unbounded call doubled the cost of the slowest query in
   # this section on a host with a large repo set.
   DNFX="$(run dnf -q repoquery --extras 2>/dev/null)"
-  printf '%s\n' "$DNFX" | head -20
+  printf '%s\n' "$DNFX" | cap 20
   EXTRA="$(printf '%s\n' "$DNFX" | grep -c .)"
   [ "${EXTRA:-0}" -gt 0 ] && chk packages.orphaned FAIL "${EXTRA} package(s) not provided by any repo" "no security updates reach these"
 fi
@@ -2772,8 +2857,8 @@ fi
 
 # --- what an administrator deliberately added: the real review list ---
 raw "manually installed packages (the deliberate additions — review these, not the base system)"
-have apt-mark && apt-mark showmanual 2>/dev/null | tr '\n' ' ' | fold -w 160 | head -10
-have dnf && run dnf -q repoquery --userinstalled 2>/dev/null | head -30
+have apt-mark && apt-mark showmanual 2>/dev/null | tr '\n' ' ' | fold -w 160 | cap 10
+have dnf && run dnf -q repoquery --userinstalled 2>/dev/null | cap 30
 
 # --- toolchains and dual-use tooling that do not belong on a production server ---
 raw "build toolchains, network tooling and interpreters present"
@@ -2869,15 +2954,15 @@ cat <<'HOWTO'
                      leave it resident.
 HOWTO
 # --- snap / flatpak: a second, independently-updated software channel ---
-if have snap; then raw "snap packages"; run snap list 2>/dev/null | head -15
+if have snap; then raw "snap packages"; run snap list 2>/dev/null | cap 15
   SN="$(snap list 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
   [ "${SN:-0}" -gt 0 ] && chk packages.snap INFO "${SN} snap(s)" "snaps update on their own schedule outside apt/dnf, so distro patch reporting does not cover them"
 fi
-have flatpak && { raw "flatpak"; run flatpak list 2>/dev/null | head -10; }
+have flatpak && { raw "flatpak"; run flatpak list 2>/dev/null | cap 10; }
 raw "language package managers with globally installed packages"
-have pip3 && run pip3 list --user 2>/dev/null | head -10
-have npm && run npm ls -g --depth=0 2>/dev/null | head -10
-have gem && run gem list --local 2>/dev/null | head -10
+have pip3 && run pip3 list --user 2>/dev/null | cap 10
+have npm && run npm ls -g --depth=0 2>/dev/null | cap 10
+have gem && run gem list --local 2>/dev/null | cap 10
 
 raw "risky / unnecessary packages present"
 for p in telnet telnetd rsh-server rsh-client talk talkd ypbind ypserv tftp tftpd xinetd inetutils-inetd \
@@ -3002,8 +3087,8 @@ have systemctl && run systemctl is-active rsyslog syslog-ng journald systemd-jou
 raw "journald config"
 grep -rhvE '^\s*#|^\s*$' "$(rf /etc/systemd/journald.conf)" "$(rf /etc/systemd/journald.conf.d/)" 2>/dev/null
 raw "rsyslog remote forwarding rules"
-grep -rhE '^\s*[^#]*@' "$(rf /etc/rsyslog.conf)" "$(rf /etc/rsyslog.d/)" 2>/dev/null | head -30
-grep -rhE 'omfwd|target=|StreamDriver|DefaultNetstreamDriver|action\(' "$(rf /etc/rsyslog.conf)" "$(rf /etc/rsyslog.d/)" 2>/dev/null | head -30
+grep -rhE '^\s*[^#]*@' "$(rf /etc/rsyslog.conf)" "$(rf /etc/rsyslog.d/)" 2>/dev/null | cap 30
+grep -rhE 'omfwd|target=|StreamDriver|DefaultNetstreamDriver|action\(' "$(rf /etc/rsyslog.conf)" "$(rf /etc/rsyslog.d/)" 2>/dev/null | cap 30
 REMOTE=0
 grep -rqsE '^\s*[^#]*\*\.\*\s*@|omfwd|@@' "$(rf /etc/rsyslog.conf)" "$(rf /etc/rsyslog.d/)" "$(rf /etc/syslog-ng/)" 2>/dev/null && REMOTE=1
 grep -rqs 'ForwardToSyslog=yes\|Storage=' "$(rf /etc/systemd/journald.conf)" 2>/dev/null
@@ -3033,7 +3118,7 @@ else
   chk logging.remote FAIL "local only" "no syslog forwarding and no shipping agent — an attacker with root deletes the only copy of the evidence"
 fi
 raw "auditd"
-have auditctl && [ "$AM_ROOT" = "1" ] && { run auditctl -s; run auditctl -l | head -60; }
+have auditctl && [ "$AM_ROOT" = "1" ] && { run auditctl -s; run auditctl -l | cap 60; }
 if [ "$OFFLINE" = "1" ] || ! have systemctl; then
   # offline / no systemd: the configured state is still checkable from files
   if [ -r "$(rf /etc/audit/auditd.conf)" ] || dir_readable "$(rf /etc/audit/rules.d)"; then
@@ -3112,7 +3197,7 @@ if [ -r "$(rf /etc/logrotate.conf)" ]; then
   fi
 
   raw "per-logfile retention overrides in /etc/logrotate.d/"
-  for f in /etc/logrotate.d/*; do
+  for f in "$LSA_ROOT"/etc/logrotate.d/*; do
     [ -r "$f" ] || continue
     # a logrotate block may cover several paths; accumulate them all so the
     # security-relevant one (auth.log) is not hidden behind a later sibling
@@ -3128,7 +3213,7 @@ if [ -r "$(rf /etc/logrotate.conf)" ]; then
         inblk=0
       }
     ' "$f" 2>/dev/null
-  done | head -40
+  done | cap 40
 
   # the security-relevant logs specifically
   raw "retention for the security-relevant logs"
@@ -3180,7 +3265,7 @@ chk logperm.var_log INFO "$VLD" ""
 WRLIST="$(find "$(rf /var/log)" -maxdepth 3 -type f -perm -004 -print 2>/dev/null | head -40)"
 NWR="$(find "$(rf /var/log)" -maxdepth 3 -type f -perm -004 -print 2>/dev/null | wc -l | tr -d ' ')"
 if [ "${NWR:-0}" -gt 0 ]; then
-  printf '%s\n' "$WRLIST" | tr '\n' '\0' | xargs -0 ls -l 2>/dev/null | head -40
+  printf '%s\n' "$WRLIST" | tr '\n' '\0' | xargs -0 ls -l 2>/dev/null | cap 40
   chk logperm.world_readable FAIL "${NWR} world-readable file(s) under /var/log" "every local user — including a compromised low-privilege service account — can read these. Logs disclose usernames, source IPs, internal hostnames, file paths, software versions, cron command lines, and often tokens or query strings; they are reconnaissance material and sometimes contain credentials outright"
 else
   chk logperm.world_readable PASS "no world-readable files under /var/log" ""
@@ -3208,7 +3293,7 @@ fi
 # journald access is group-based: systemd-journal (all), adm/wheel (via ACL)
 if [ -d "$(rf /var/log/journal)" ]; then
   raw "journal ACLs (who can read the journal without root)"
-  have getfacl && run getfacl -p /var/log/journal 2>/dev/null | head -12
+  have getfacl && run getfacl -p /var/log/journal 2>/dev/null | cap 12
   ls -ld "$LSA_ROOT"/var/log/journal/* 2>/dev/null | head -3
 fi
 
@@ -3222,7 +3307,7 @@ LOGREADERS="$( { getent group adm 2>/dev/null | cut -d: -f4; getent group system
 
 # logrotate's create mode decides the permissions of every FUTURE rotated file
 raw "logrotate 'create' modes (these set the permissions of rotated logs)"
-grep -rhE '^\s*(create|su)\s' "$(rf /etc/logrotate.conf)" "$(rf /etc/logrotate.d/)" 2>/dev/null | sed 's/  */ /g' | sort | uniq -c | sort -rn | head -15
+grep -rhE '^\s*(create|su)\s' "$(rf /etc/logrotate.conf)" "$(rf /etc/logrotate.d/)" 2>/dev/null | sed 's/  */ /g' | sort | uniq -c | sort -rn | cap 15
 # a mode whose final (other) digit is 4-7 grants world read on every rotated file
 if grep -rhqE '^[[:space:]]*create[[:space:]]+[0-9]*[4567][[:space:]]' "$(rf /etc/logrotate.conf)" "$(rf /etc/logrotate.d/)" 2>/dev/null; then
   chk logperm.logrotate_create FAIL "$(grep -rhE '^[[:space:]]*create[[:space:]]+[0-9]*[4567][[:space:]]' "$(rf /etc/logrotate.conf)" "$(rf /etc/logrotate.d/)" 2>/dev/null | sed 's/^[[:space:]]*//' | sort -u | head -3 | tr '\n' ';')" "logrotate recreates these logs world-readable after every rotation — fixing the permissions by hand will silently revert at the next rotate"
@@ -3288,13 +3373,13 @@ elif have dpkg; then
   raw "dpkg --verify (built in; flags are ??5?????? = md5 mismatch, 'c' marks a conffile)"
   DPKGV="$(tmo 600 dpkg --verify 2>/dev/null)"
   PKGV_RUN=yes
-  printf '%s\n' "$DPKGV" | head -60
+  printf '%s\n' "$DPKGV" | cap 60
   PKGV_CFG="$(printf '%s\n' "$DPKGV" | grep -c ' c /' )"
   PKGV_MISS="$(printf '%s\n' "$DPKGV" | grep -c '^missing' )"
   PKGV_BIN="$(printf '%s\n' "$DPKGV" | grep -v ' c /' | grep -oE '/[^ ]+$' | grep -E "$SYSBIN_RE" | head -25 | tr '\n' ' ')"
   if have debsums; then
     raw "debsums -c (cross-check; covers only packages that shipped md5sums)"
-    tmo 600 debsums -c 2>/dev/null | head -30
+    tmo 600 debsums -c 2>/dev/null | cap 30
     NOSUMS="$(tmo 120 debsums -l 2>/dev/null | wc -l | tr -d ' ')"
     [ "${NOSUMS:-0}" -gt 0 ] && chk integrity.pkgverify_coverage WARN "${NOSUMS} package(s) ship no checksums" "these cannot be verified at all — a real coverage gap, not a pass. 'debsums -l' lists them"
   else
@@ -3304,17 +3389,17 @@ elif have rpm; then
   raw "rpm -Va (S=size M=mode 5=digest D=device L=symlink U=user G=group T=mtime P=capabilities)"
   RPMV="$(tmo 900 rpm -Va --nodeps --noscripts 2>/dev/null)"
   PKGV_RUN=yes
-  printf '%s\n' "$RPMV" | head -60
+  printf '%s\n' "$RPMV" | cap 60
   PKGV_CFG="$(printf '%s\n' "$RPMV" | grep -c ' c /' )"
   PKGV_MISS="$(printf '%s\n' "$RPMV" | grep -c 'missing' )"
   PKGV_BIN="$(printf '%s\n' "$RPMV" | grep -v ' c /' | grep -E '^[SM5DLUGTP.?]{9}' | grep '5' | grep -oE '/[^ ]+$' | grep -E "$SYSBIN_RE" | head -25 | tr '\n' ' ')"
   raw "mode / owner / capability changes on packaged files (not content, but still tampering)"
-  printf '%s\n' "$RPMV" | grep -E '^([SM5DLUGTP.?]*[MUGP])' | grep -v ' c /' | head -20
+  printf '%s\n' "$RPMV" | grep -E '^([SM5DLUGTP.?]*[MUGP])' | grep -v ' c /' | cap 20
   MODEC="$(printf '%s\n' "$RPMV" | grep -cE '^[SM5DLUGTP.?]*[MUGP]' )"
   [ "${MODEC:-0}" -gt 0 ] && chk integrity.pkgverify_modes WARN "${MODEC} packaged file(s) with changed mode/owner/capabilities" "content unchanged but permissions were altered — check for a removed or added setuid bit, or an added file capability, on a packaged binary"
 elif have apk; then
   raw "apk audit --system"
-  tmo 300 apk audit --system 2>/dev/null | head -40
+  tmo 300 apk audit --system 2>/dev/null | cap 40
   PKGV_RUN=yes
   PKGV_BIN="$(tmo 300 apk audit --system 2>/dev/null | awk '$1=="U"{print $2}' | grep -E "$SYSBIN_RE" | head -25 | tr '\n' ' ')"
 else
@@ -3347,7 +3432,7 @@ fi
 raw "rkhunter/chkrootkit"
 have rkhunter && echo "rkhunter installed"; have chkrootkit && echo "chkrootkit installed"
 raw "recently modified files in system bin dirs (last 7 days)"
-find "$(rf /usr/bin)" "$(rf /usr/sbin)" "$(rf /bin)" "$(rf /sbin)" "$(rf /usr/local/bin)" "$(rf /usr/local/sbin)" -xdev -type f -mtime -7 -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | head -30
+find "$(rf /usr/bin)" "$(rf /usr/sbin)" "$(rf /bin)" "$(rf /sbin)" "$(rf /usr/local/bin)" "$(rf /usr/local/sbin)" -xdev -type f -mtime -7 -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | cap 30
 
 # ------------------------------------------------------------- 21. SCHEDULED
 sec SCHEDULED_TASKS
@@ -3394,7 +3479,7 @@ CRONCMDS="$( {
   fi
 } 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$' | sort -u )"
 
-printf '%s\n' "$CRONCMDS" | head -40
+printf '%s\n' "$CRONCMDS" | cap 40
 
 CRONFIND=0
 printf '%s\n' "$CRONCMDS" | while IFS= read -r cmd; do
@@ -3431,7 +3516,7 @@ printf '%s\n' "$CRONCMDS" | while IFS= read -r cmd; do
         printf '  NOTE glob passed to an archiving/permission tool: %s\n' "$(printf '%s' "$cmd" | cut -c1-90)"
       fi ;;
   esac
-done | sort -u | head -40
+done | sort -u | cap 40
 
 # emit a verdict based on a second, non-subshell pass so the count survives
 CRONRISK=0
@@ -3463,11 +3548,11 @@ if [ -n "$CRONPATH" ]; then
                   || chk cron.path PASS "cron PATH elements are root-owned and not writable" ""
 fi
 raw "root jobs calling commands by bare name (resolved via cron PATH)"
-printf '%s\n' "$CRONCMDS" | grep -vE '^\s*/' | head -10
+printf '%s\n' "$CRONCMDS" | grep -vE '^\s*/' | cap 10
 
 # --- run-parts directory permissions: write access here = arbitrary root execution ---
 raw "cron directory permissions (write access to any of these is root execution)"
-for d in /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron /var/spool/cron/crontabs /etc/crontab; do
+for d in "$LSA_ROOT"/etc/cron.d "$LSA_ROOT"/etc/cron.hourly "$LSA_ROOT"/etc/cron.daily "$LSA_ROOT"/etc/cron.weekly "$LSA_ROOT"/etc/cron.monthly "$LSA_ROOT"/var/spool/cron "$LSA_ROOT"/var/spool/cron/crontabs "$LSA_ROOT"/etc/crontab; do
   [ -e "$d" ] || continue
   s="$(stat -c '%a %U:%G' "$d" 2>/dev/null)"
   printf '  %-30s %s\n' "$d" "$s"
@@ -3512,7 +3597,7 @@ if have usbguard || [ -d "$(rf /etc/usbguard)" ]; then
   else
     chk usb.usbguard FAIL "installed but not active" "the daemon must be enabled and running for the policy to apply"
   fi
-  [ "$AM_ROOT" = "1" ] && have usbguard && { raw "usbguard device list"; run usbguard list-devices 2>/dev/null | head -20; raw "usbguard rules"; run usbguard list-rules 2>/dev/null | head -20; }
+  [ "$AM_ROOT" = "1" ] && have usbguard && { raw "usbguard device list"; run usbguard list-devices 2>/dev/null | cap 20; raw "usbguard rules"; run usbguard list-rules 2>/dev/null | cap 20; }
   raw "usbguard IPC access (who can change the policy)"
   grep -hE '^\s*IPCAllowed(Users|Groups)' "$(rf /etc/usbguard/usbguard-daemon.conf)" 2>/dev/null
 else
@@ -3541,8 +3626,8 @@ if [ -n "$AD_STATE" ]; then
                        || chk usb.authorized_default WARN "$AD_STATE" "every USB controller authorizes new devices automatically; a udev rule setting authorized_default=0 is the no-extra-software way to change this"
 fi
 raw "udev rules mentioning USB authorization / mass storage"
-grep -rlsE 'authorized|usb_storage|ID_USB|SUBSYSTEM=="usb"' "$(rf /etc/udev/rules.d/)" 2>/dev/null | head -10
-grep -rhsE 'authorized' "$(rf /etc/udev/rules.d/)" 2>/dev/null | head -10
+grep -rlsE 'authorized|usb_storage|ID_USB|SUBSYSTEM=="usb"' "$(rf /etc/udev/rules.d/)" 2>/dev/null | cap 10
+grep -rhsE 'authorized' "$(rf /etc/udev/rules.d/)" 2>/dev/null | cap 10
 
 # --- 4. module-level: block the drivers that make a rogue device useful ---
 USBMODS=""
@@ -3605,6 +3690,7 @@ have sudo && run sudo -V 2>/dev/null | head -2
 SUDOV="$(sudo -V 2>/dev/null | awk '/version/{print $NF; exit}')"
 runtime_on   # queries the installed binary, not the image
 chk sudo.version INFO "${SUDOV:-unknown}" "compare against CVE-2021-3156 (Baron Samedit, <1.9.5p2), CVE-2019-14287 (Runas -1 bypass, <1.8.28), CVE-2023-22809 (sudoedit EDITOR, 1.8.0-1.9.12p1), CVE-2025-32463 (chroot, <1.9.17p1)"
+method_reset   # sudo.version was runtime; everything below reads the sudoers file itself
 raw "sudo Defaults lines"
 printf '%s\n' "$SUDOALL" | grep -iE '^\s*Defaults'
 # env_keep with the dynamic-linker variables is an unconditional root shell
@@ -3632,7 +3718,7 @@ if [ "$SUDO_READ" = "1" ]; then
     [ -n "$H" ] && chk "sudo.gtfobins.$2" FAIL "$H" "$3"
   }
   raw "sudo command grants matched against GTFOBins escalation primitives"
-  printf '%s\n' "$SUDOALL" | grep -vE '^\s*(Defaults|#)' | grep -E '=' | head -30
+  printf '%s\n' "$SUDOALL" | grep -vE '^\s*(Defaults|#)' | grep -E '=' | cap 30
   gtfo_hits "$GTFO_SHELL"     shell     "these spawn or wrap a shell directly — granting them via sudo is granting root, full stop"
   gtfo_hits "$GTFO_EDITOR"    editor    "pagers and editors escape to a shell (:!sh in vi/less/man). Granting them via sudo is granting root"
   gtfo_hits "$GTFO_INTERP"    interp    "an interpreter executes arbitrary code by definition — python -c 'import os;os.system(\"/bin/sh\")'"
@@ -3658,13 +3744,13 @@ ls -l "$(rf /etc/sudoers)" 2>/dev/null; ls -l "$(rf /etc/sudoers.d/)" 2>/dev/nul
 SM="$(stat -c '%a %U:%G' "$(rf /etc/sudoers)" 2>/dev/null)"
 case "${SM%% *}" in 440|400|0440|0400) chk sudo.file_perms PASS "$SM" "" ;;
   "") ;; *) chk sudo.file_perms FAIL "$SM" "/etc/sudoers must be 0440 root:root — anything writable here is a direct root grant" ;; esac
-for f in /etc/sudoers.d/*; do
+for f in "$LSA_ROOT"/etc/sudoers.d/*; do
   [ -f "$f" ] || continue
   m="$(stat -c '%a %U:%G' "$f" 2>/dev/null)"
   case "${m%% *}" in 440|400|0440|0400) ;; *) chk "sudo.dperms.$(basename "$f")" FAIL "$m $f" "sudoers.d file with permissions looser than 0440" ;; esac
   case "$m" in *" root:"*) ;; *) chk "sudo.downer.$(basename "$f")" FAIL "$m $f" "sudoers.d file not owned by root" ;; esac
 done
-have visudo && { raw "visudo -c (syntax validity)"; run visudo -c 2>&1 | head -10; }
+have visudo && { raw "visudo -c (syntax validity)"; run visudo -c 2>&1 | cap 10; }
 raw "sudoers include directives"
 grep -hE '^\s*[#@]include' "$(rf /etc/sudoers)" 2>/dev/null
 
@@ -3687,9 +3773,9 @@ for g in sudo wheel admin sudoers; do
   M="$(getent group "$g" 2>/dev/null | cut -d: -f4)"
   [ -n "$M" ] && printf '  %-10s %s\n' "$g" "$M"
 done
-printf '%s\n' "$SUDOALL" | grep -E '^\s*%' | head -10
+printf '%s\n' "$SUDOALL" | grep -E '^\s*%' | cap 10
 raw "sudo grants for the invoking user (non-authoritative: only this account)"
-[ "$PROBE" = "1" ] && { active_on; run sudo -n -l 2>/dev/null | head -20; active_off; }
+[ "$PROBE" = "1" ] && { active_on; run sudo -n -l 2>/dev/null | cap 20; active_off; }
 raw "recent sudo usage from the logs"
 grep -rhs 'sudo:' "$(rf /var/log/auth.log)" "$(rf /var/log/secure)" 2>/dev/null | tail -10
 have journalctl && run journalctl -q --no-pager -n 10 -t sudo 2>/dev/null
@@ -3725,7 +3811,7 @@ else
   chk privesc.writable_units PASS "no group/world-writable unit files" ""
 fi
 raw "unit files not owned by root"
-find "$(rf /etc/systemd/system)" "$(rf /lib/systemd/system)" "$(rf /usr/lib/systemd/system)" -maxdepth 2 -type f ! -user root -print 2>/dev/null | head -10
+find "$(rf /etc/systemd/system)" "$(rf /lib/systemd/system)" "$(rf /usr/lib/systemd/system)" -maxdepth 2 -type f ! -user root -print 2>/dev/null | cap 10
 raw "writable ExecStart binaries of running units"
 if have systemctl; then
   systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print $1}' | head -40 | while read -r u; do
@@ -3737,7 +3823,7 @@ if have systemctl; then
       ?[2367]?) printf '  GROUP-WRITABLE %s %s (%s)\n' "$m" "$b" "$u" ;;
     esac
     case "$m" in *" root") ;; *) printf '  NOT-ROOT-OWNED %s %s (%s)\n' "$m" "$b" "$u" ;; esac
-  done | head -20
+  done | cap 20
 fi
 
 # ---- NFS exports: no_root_squash is a one-line root escalation for any client ----
@@ -3754,11 +3840,11 @@ if [ -r "$(rf /etc/exports)" ] || [ -d "$(rf /etc/exports.d)" ]; then
   have showmount && [ "$PROBE" = "1" ] && { raw "showmount -e localhost"; active_on; run showmount -e localhost 2>/dev/null; active_off; }
 fi
 raw "NFS mounts on this host (client side)"
-grep -E '\snfs[45]?\s' /proc/mounts 2>/dev/null | head -10
+grep -E '\snfs[45]?\s' /proc/mounts 2>/dev/null | cap 10
 
 # ---- credentials and keys lying around ----
 raw "private keys and credential files with weak permissions"
-for d in /root /home/*; do
+for d in "$LSA_ROOT"/root "$LSA_ROOT"/home/*; do
   [ -d "$d" ] || continue
   for f in "$d"/.ssh/id_* "$d"/.ssh/*.pem "$d"/.netrc "$d"/.pgpass "$d"/.git-credentials \
            "$d"/.aws/credentials "$d"/.docker/config.json "$d"/.kube/config "$d"/.gnupg/*.key; do
@@ -3782,7 +3868,7 @@ for d in /root /home/*; do
   done
 done
 raw "unencrypted SSH private keys (no passphrase = usable immediately if stolen)"
-for k in /root/.ssh/id_* /home/*/.ssh/id_*; do
+for k in "$LSA_ROOT"/root/.ssh/id_* "$LSA_ROOT"/home/*/.ssh/id_*; do
   [ -f "$k" ] || continue; case "$k" in *.pub) continue ;; esac
   if head -3 "$k" 2>/dev/null | grep -q 'ENCRYPTED'; then printf '  encrypted   %s\n' "$k"
   else printf '  UNENCRYPTED %s\n' "$k"; fi
@@ -3793,7 +3879,7 @@ ls -l "$(rf /root/.rhosts)" "$LSA_ROOT"/home/*/.rhosts "$(rf /root/.forward)" "$
 
 # ---- shell history: anti-forensics and leaked secrets ----
 raw "shell history configuration and anti-forensics indicators"
-for h in /root/.bash_history /home/*/.bash_history /root/.zsh_history /home/*/.zsh_history; do
+for h in "$LSA_ROOT"/root/.bash_history "$LSA_ROOT"/home/*/.bash_history "$LSA_ROOT"/root/.zsh_history "$LSA_ROOT"/home/*/.zsh_history; do
   [ -e "$h" ] || continue
   if [ -L "$h" ]; then
     printf '  SYMLINK %s -> %s\n' "$h" "$(readlink "$h")"
@@ -3802,11 +3888,11 @@ for h in /root/.bash_history /home/*/.bash_history /root/.zsh_history /home/*/.z
     printf '  %s %s (%s bytes)\n' "$(stat -c '%a %U' "$h" 2>/dev/null)" "$h" "$(stat -c '%s' "$h" 2>/dev/null)"
   fi
 done
-grep -rhsE '^\s*(export\s+)?(HISTFILE|HISTSIZE|HISTFILESIZE|HISTCONTROL)\s*=' "$(rf /etc/profile)" "$(rf /etc/bash.bashrc)" "$(rf /etc/profile.d/)" "$(rf /root/.bashrc)" "$LSA_ROOT"/home/*/.bashrc 2>/dev/null | sort -u | head -10
+grep -rhsE '^\s*(export\s+)?(HISTFILE|HISTSIZE|HISTFILESIZE|HISTCONTROL)\s*=' "$(rf /etc/profile)" "$(rf /etc/bash.bashrc)" "$(rf /etc/profile.d/)" "$(rf /root/.bashrc)" "$LSA_ROOT"/home/*/.bashrc 2>/dev/null | sort -u | cap 10
 grep -rqsE '(HISTFILE=/dev/null|HISTSIZE=0|unset\s+HISTFILE)' "$(rf /etc/profile)" "$(rf /etc/profile.d/)" "$(rf /root/.bashrc)" "$LSA_ROOT"/home/*/.bashrc 2>/dev/null \
   && chk privesc.history_disabled FAIL "HISTFILE=/dev/null or HISTSIZE=0 configured" "command history disabled system-wide or for a user — removes the record of what was run"
 raw "possible secrets in shell history (pattern match only, no values shown)"
-for h in /root/.bash_history /home/*/.bash_history; do
+for h in "$LSA_ROOT"/root/.bash_history "$LSA_ROOT"/home/*/.bash_history; do
   [ -r "$h" ] || continue
   n="$(grep -ciE '(password|passwd|secret|token|api[_-]?key|-p[[:alnum:]]|curl.*-u )' "$h" 2>/dev/null)"
   [ "${n:-0}" -gt 0 ] && printf '  %s: %s line(s) matching credential patterns\n' "$h" "$n"
@@ -3814,7 +3900,7 @@ done
 
 # ---- user dotfile permissions (CIS) ----
 raw "group/world-writable dotfiles in home directories"
-find "$(rf /root)" "$(rf /home)" -maxdepth 2 -name '.*' -type f \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | head -15
+find "$(rf /root)" "$(rf /home)" -maxdepth 2 -name '.*' -type f \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | cap 15
 
 # ---- binfmt_misc: registered interpreters run on execve of a matching file ----
 if [ -d /proc/sys/fs/binfmt_misc ]; then
@@ -3842,9 +3928,11 @@ COMPS="$(for c in gcc cc g++ clang tcc; do have_target "$c" && printf '%s ' "$c"
 # ---- writable SUID/SGID binaries: instant root ----
 if [ "$QUICK" != "1" ]; then
   raw "writable SUID/SGID binaries"
+  _oifs=$IFS; IFS=$'\n'
   for d in $SCANDIRS; do
     find "$d" -xdev \( -perm -4000 -o -perm -2000 \) -type f -perm -0022 -print 2>/dev/null
   done | head -10 | tr '\n' '\0' | xargs -0 ls -l 2>/dev/null
+  IFS=$_oifs
 fi
 
 # ------------------------------------------------- 24. DATA SERVICE AUTHENTICATION
@@ -3905,7 +3993,7 @@ fi
 PGHBA2="$(ls "$LSA_ROOT"/etc/postgresql/*/main/pg_hba.conf "$(rf /var/lib/pgsql/data/pg_hba.conf)" 2>/dev/null | head -1)"
 if [ -n "$PGHBA2" ]; then
   raw "postgresql pg_hba.conf auth methods"
-  grep -vE '^\s*#|^\s*$' "$PGHBA2" 2>/dev/null | head -20
+  grep -vE '^\s*#|^\s*$' "$PGHBA2" 2>/dev/null | cap 20
   grep -qE '^\s*(local|host|hostssl|hostnossl)\s+.*\s+trust\s*$' "$PGHBA2" 2>/dev/null \
     && chk dbauth.postgres_trust FAIL "$(grep -E '\strust\s*$' "$PGHBA2" | head -2 | tr '\n' ';')" "'trust' authentication accepts any connection as any database user with NO password" \
     || chk dbauth.postgres_trust PASS "no trust auth methods" ""
@@ -3927,7 +4015,7 @@ fi
 SNMPC="$(ls "$(rf /etc/snmp/snmpd.conf)" 2>/dev/null | head -1)"
 if [ -n "$SNMPC" ]; then
   raw "snmpd configuration"
-  grep -hvE '^\s*#|^\s*$' "$SNMPC" 2>/dev/null | head -20
+  grep -hvE '^\s*#|^\s*$' "$SNMPC" 2>/dev/null | cap 20
   if grep -qE '^\s*(rocommunity|rwcommunity)6?\s+(public|private)\b' "$SNMPC" 2>/dev/null; then
     chk snmp.default_community FAIL "$(grep -E '^\s*r[ow]community' "$SNMPC" | head -2 | tr '\n' ';')" "default community string — 'public'/'private' are the first thing any scanner tries, and they expose a full inventory of the host (and with rwcommunity, write access)"
   else
@@ -4081,7 +4169,7 @@ fi
 if [ -r "$(rf /etc/proftpd/proftpd.conf)" ] || [ -r "$(rf /etc/proftpd.conf)" ]; then
   PC="$(ls "$(rf /etc/proftpd/proftpd.conf)" "$(rf /etc/proftpd.conf)" 2>/dev/null | head -1)"
   raw "proftpd configuration"
-  grep -hiE '^\s*(<Anonymous|User|Group|RequireValidShell|DefaultRoot|TLSEngine|TLSRequired|AllowOverwrite|<Limit|AllowAll|DenyAll|UseFtpUsers)' "$PC" 2>/dev/null | head -25
+  grep -hiE '^\s*(<Anonymous|User|Group|RequireValidShell|DefaultRoot|TLSEngine|TLSRequired|AllowOverwrite|<Limit|AllowAll|DenyAll|UseFtpUsers)' "$PC" 2>/dev/null | cap 25
   grep -qiE '^\s*<Anonymous' "$PC" 2>/dev/null && chk ftp.proftpd_anonymous FAIL "<Anonymous> block present" "anonymous FTP access configured"
   grep -qiE '^\s*TLSEngine\s+on' "$PC" 2>/dev/null || chk ftp.proftpd_tls FAIL "TLSEngine not on" "cleartext credentials"
   grep -qiE '^\s*DefaultRoot\s+~' "$PC" 2>/dev/null || chk ftp.proftpd_chroot WARN "no DefaultRoot ~" "users are not confined to their home directory"
@@ -4097,7 +4185,7 @@ fi
 if [ -r "$(rf /etc/default/tftpd-hpa)" ] || [ -d "$(rf /etc/xinetd.d)" ] && grep -rqs tftp "$(rf /etc/xinetd.d/)" 2>/dev/null; then
   raw "tftp configuration"
   grep -hvE '^\s*#|^\s*$' "$(rf /etc/default/tftpd-hpa)" 2>/dev/null
-  grep -rhs -A8 'service tftp' "$(rf /etc/xinetd.d/)" 2>/dev/null | head -15
+  grep -rhs -A8 'service tftp' "$(rf /etc/xinetd.d/)" 2>/dev/null | cap 15
   grep -qs -- '-c\|--create' /etc/default/tftpd-hpa 2>/dev/null \
     && chk tftp.upload FAIL "TFTP_OPTIONS includes -c (create)" "unauthenticated WRITE to the TFTP root — anyone on the network can upload files"
   chk tftp.present WARN "tftpd configured" "TFTP has no authentication and no encryption; restrict by firewall to the provisioning VLAN and keep the root read-only"
@@ -4106,9 +4194,9 @@ fi
 # ---- Samba / SMB ----
 if [ -r "$(rf /etc/samba/smb.conf)" ]; then
   raw "samba configuration (global + shares)"
-  grep -hvE '^\s*#|^\s*;|^\s*$' "$(rf /etc/samba/smb.conf)" 2>/dev/null | head -60
+  grep -hvE '^\s*#|^\s*;|^\s*$' "$(rf /etc/samba/smb.conf)" 2>/dev/null | cap 60
   SMB="$(grep -hvE '^\s*#|^\s*;|^\s*$' "$(rf /etc/samba/smb.conf)" 2>/dev/null)"
-  have testparm && [ "$AM_ROOT" = "1" ] && { raw "testparm -s (effective config)"; run testparm -s 2>/dev/null | head -40; }
+  have testparm && [ "$AM_ROOT" = "1" ] && { raw "testparm -s (effective config)"; run testparm -s 2>/dev/null | cap 40; }
   printf '%s' "$SMB" | grep -qiE '^\s*(guest ok|public)\s*=\s*yes' \
     && chk smb.guest FAIL "$(printf '%s' "$SMB" | grep -iE '^\s*(guest ok|public)\s*=' | head -2 | tr '\n' ';')" "guest access — the share is readable (and if writable, writable) with no credentials" \
     || chk smb.guest PASS "no guest-enabled shares" ""
@@ -4128,7 +4216,7 @@ if [ -r "$(rf /etc/samba/smb.conf)" ]; then
     && chk smb.hosts_allow PASS "hosts allow/deny set" "" \
     || chk smb.hosts_allow WARN "no hosts allow/deny" "no source restriction at the Samba layer"
   raw "writable samba shares"
-  printf '%s\n' "$SMB" | awk '/^\[/{s=$0} /^[[:space:]]*(writable|writeable|read only)[[:space:]]*=/{print "  "s" "$0}' | head -15
+  printf '%s\n' "$SMB" | awk '/^\[/{s=$0} /^[[:space:]]*(writable|writeable|read only)[[:space:]]*=/{print "  "s" "$0}' | cap 15
 fi
 
 # ---- mail: open relay and cleartext auth ----
@@ -4147,7 +4235,7 @@ if [ -r "$(rf /etc/postfix/main.cf)" ]; then
 fi
 if [ -d "$(rf /etc/dovecot)" ]; then
   raw "dovecot auth settings"
-  grep -rhE '^\s*(disable_plaintext_auth|ssl|ssl_min_protocol|auth_mechanisms)' "$(rf /etc/dovecot/)" 2>/dev/null | head -10
+  grep -rhE '^\s*(disable_plaintext_auth|ssl|ssl_min_protocol|auth_mechanisms)' "$(rf /etc/dovecot/)" 2>/dev/null | cap 10
   grep -rqE '^\s*disable_plaintext_auth\s*=\s*yes' "$(rf /etc/dovecot/)" 2>/dev/null \
     && chk mail.dovecot_plaintext PASS "disable_plaintext_auth=yes" "" \
     || chk mail.dovecot_plaintext FAIL "plaintext auth not disabled" "IMAP/POP3 passwords accepted over an unencrypted connection"
@@ -4157,7 +4245,7 @@ fi
 # ---- LDAP server: anonymous bind ----
 if [ -r "$(rf /etc/ldap/slapd.conf)" ] || [ -d "$(rf /etc/ldap/slapd.d)" ] || [ -d "$(rf /etc/openldap/slapd.d)" ]; then
   raw "slapd access controls"
-  grep -rhE '^\s*(access to|olcAccess|disallow|require|TLSCipherSuite|olcTLS)' "$(rf /etc/ldap/)" "$(rf /etc/openldap/)" 2>/dev/null | head -20
+  grep -rhE '^\s*(access to|olcAccess|disallow|require|TLSCipherSuite|olcTLS)' "$(rf /etc/ldap/)" "$(rf /etc/openldap/)" 2>/dev/null | cap 20
   grep -rqE 'disallow.*bind_anon|olcDisallows.*bind_anon' "$(rf /etc/ldap/)" "$(rf /etc/openldap/)" 2>/dev/null \
     && chk ldap.anon_bind PASS "anonymous bind disallowed" "" \
     || chk ldap.anon_bind WARN "anonymous bind not disallowed" "an anonymous LDAP bind usually enumerates the entire directory: users, groups, and often more"
@@ -4179,7 +4267,7 @@ fi
 # ---- Squid: open forward proxy ----
 if [ -r "$(rf /etc/squid/squid.conf)" ]; then
   raw "squid access controls"
-  grep -hE '^\s*(http_access|http_port|acl localnet|cache_effective_user)' "$(rf /etc/squid/squid.conf)" 2>/dev/null | head -20
+  grep -hE '^\s*(http_access|http_port|acl localnet|cache_effective_user)' "$(rf /etc/squid/squid.conf)" 2>/dev/null | cap 20
   grep -qE '^\s*http_access\s+allow\s+all' "$(rf /etc/squid/squid.conf)" 2>/dev/null \
     && chk proxy.squid_open FAIL "http_access allow all" "open forward proxy — used to pivot into internal networks and to launder attack traffic through your IP"
 fi
@@ -4236,7 +4324,7 @@ fi
 # ---- systemd socket units that expose a legacy service on demand ----
 if have systemctl; then
   raw "enabled socket units"
-  run systemctl list-units --type=socket --state=active --no-pager --no-legend 2>/dev/null | head -25
+  run systemctl list-units --type=socket --state=active --no-pager --no-legend 2>/dev/null | cap 25
 fi
 
 # ------------------------------------------------- 26. BOOT AND SERVICE-START TRUST CHAIN
@@ -4258,9 +4346,13 @@ bc_check() { # bc_check <path> <what referenced it>
 
 # ---- systemd units: every directive that names a file root will touch ----
 raw "systemd unit file references (EnvironmentFile, Exec*, Condition*, PIDFile, credentials...)"
-UNITDIRS="/etc/systemd/system /run/systemd/system /lib/systemd/system /usr/lib/systemd/system"
+UNITDIRS="${LSA_ROOT}/etc/systemd/system
+${LSA_ROOT}/run/systemd/system
+${LSA_ROOT}/lib/systemd/system
+${LSA_ROOT}/usr/lib/systemd/system"
 UNITFILES="$(find $UNITDIRS -maxdepth 2 -type f \( -name '*.service' -o -name '*.timer' -o -name '*.path' -o -name '*.socket' -o -name '*.mount' \) -print 2>/dev/null | head -400)"
 chk bootchain.units_scanned INFO "$(printf '%s' "$UNITFILES" | grep -c .) unit file(s)" ""
+_oifs=$IFS; IFS=$'\n'
 for u in $UNITFILES; do
   # only units that actually run as root matter here
   US="$(grep -hE '^\s*User\s*=' "$u" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')"
@@ -4271,6 +4363,7 @@ for u in $UNITFILES; do
       bc_check "$pth" "$u"
     done
 done
+IFS=$_oifs
 # recount outside the subshell
 BCU="$(for u in $UNITFILES; do
   US="$(grep -hE '^\s*User\s*=' "$u" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')"
@@ -4298,7 +4391,7 @@ raw "init scripts and rc.local"
 for f in /etc/rc.local /etc/rc.d/rc.local /etc/init.d/* /etc/rc*.d/*; do
   [ -f "$f" ] || continue
   bc_check "$f" "boot script"
-done 2>/dev/null | head -20
+done 2>/dev/null | cap 20
 
 # ---- the dynamic linker: a writable library path is code execution in EVERY root binary ----
 raw "ld.so configuration and library search paths"
@@ -4309,13 +4402,17 @@ for l in $(grep -rhvE '^\s*#|^\s*$|^include' "$(rf /etc/ld.so.conf)" "$(rf /etc/
   r="$(path_risk "$l")"
   [ -n "$r" ] && { LDBAD="$LDBAD [$r]"; }
 done
+if ! readable "$(rf /etc/ld.so.conf)" && ! dir_readable "$(rf /etc/ld.so.conf.d)"; then
+  chk bootchain.ld_so_path NA "no ld.so configuration found" "the linker search path could not be enumerated, so nothing about it is established"
+else
 [ -n "$LDBAD" ] && chk bootchain.ld_so_path FAIL "$LDBAD" "a writable directory in the dynamic linker search path means every root binary that starts can be made to load an attacker's shared object — this is the broadest possible local escalation" \
                 || chk bootchain.ld_so_path PASS "library search paths are root-owned and not writable" ""
+fi
 [ -s "$(rf /etc/ld.so.preload)" ] && { raw "/etc/ld.so.preload contents"; cat "$(rf /etc/ld.so.preload)"; }
 
 # ---- udev: RUN+= executes as root on device events, including at boot ----
 raw "udev rules that execute programs"
-grep -rhE 'RUN[+]?=' "$(rf /etc/udev/rules.d/)" /run/udev/rules.d/ 2>/dev/null | head -15
+grep -rhE 'RUN[+]?=' "$(rf /etc/udev/rules.d/)" /run/udev/rules.d/ 2>/dev/null | cap 15
 for f in $(grep -rlE 'RUN[+]?=' "$(rf /etc/udev/rules.d/)" 2>/dev/null | head -10); do bc_check "$f" "udev rule file"; done
 grep -rhoE 'RUN[+]?="[^"]*"' "$(rf /etc/udev/rules.d/)" 2>/dev/null | grep -oE '/[A-Za-z0-9._/-]+' | sort -u | head -10 | while read -r p; do bc_check "$p" "udev RUN+= target"; done
 
@@ -4324,7 +4421,7 @@ raw "shell profile scripts executed for root logins"
 for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/profile.d/* /root/.bashrc /root/.bash_profile /root/.profile; do
   [ -f "$f" ] || continue
   bc_check "$f" "root shell profile"
-done 2>/dev/null | head -20
+done 2>/dev/null | cap 20
 
 # ---- PAM, initramfs, generators ----
 raw "other root-executed chains"
@@ -4334,9 +4431,9 @@ for f in /etc/pam.d/* /etc/initramfs-tools/hooks/* /etc/initramfs-tools/scripts/
          /etc/cron.d/* /etc/logrotate.d/*; do
   [ -f "$f" ] || continue
   bc_check "$f" "root-executed configuration"
-done 2>/dev/null | head -25
+done 2>/dev/null | cap 25
 raw "logrotate postrotate scripts run as root"
-grep -rhA3 'postrotate' "$(rf /etc/logrotate.conf)" "$(rf /etc/logrotate.d/)" 2>/dev/null | grep -oE '/[A-Za-z0-9._/-]+' | sort -u | head -10
+grep -rhA3 'postrotate' "$(rf /etc/logrotate.conf)" "$(rf /etc/logrotate.d/)" 2>/dev/null | grep -oE '/[A-Za-z0-9._/-]+' | sort -u | cap 10
 
 runtime_on
 # ---- LIVE SNAPSHOT: what are root processes holding open right now? ----
@@ -4354,7 +4451,7 @@ if [ -d /proc/1/fd ]; then
       r="$(path_risk "$tgt" 2>/dev/null)"
       [ -n "$r" ] && { printf '  %s\n       open by pid %s (%s)\n' "$r" "$pid" "$(ps -o comm= -p "$pid" 2>/dev/null)"; OPENBAD=$((OPENBAD+1)); }
     done
-  done | sort -u | head -25
+  done | sort -u | cap 25
 fi
 raw "shared libraries MAPPED into root processes from non-root-owned paths"
 if [ -r /proc/1/maps ]; then
@@ -4364,7 +4461,7 @@ if [ -r /proc/1/maps ]; then
     case "$lib" in /*) ;; *) continue ;; esac
     r="$(path_risk "$lib" 2>/dev/null)"
     [ -n "$r" ] && printf '  %s (mapped into a root process)\n' "$r"
-  done | sort -u | head -15
+  done | sort -u | cap 15
 fi
 MAPBAD="$(if [ -r /proc/1/maps ]; then
   for pid in $(ps -eo pid,user 2>/dev/null | awk '$2=="root"{print $1}' | head -60); do
@@ -4414,7 +4511,8 @@ emit_secret() { # emit_secret <file> <grepline "n:content"> <kind>
 
 # bounded candidate list: config-shaped files in the places credentials actually live
 SECRET_FILES="$( {
-  for r in $DOCROOTS /var/www /srv /opt /etc /root /home; do
+  _oifs=$IFS; IFS=$'\n'
+  for r in $DOCROOTS "$LSA_ROOT"/var/www "$LSA_ROOT"/srv "$LSA_ROOT"/opt "$LSA_ROOT"/etc "$LSA_ROOT"/root "$LSA_ROOT"/home; do
     [ -d "$r" ] || continue
     find "$r" -maxdepth 4 -type f -size -512k \( \
         -name '.env' -o -name '.env.*' -o -name '*.env' -o -name 'wp-config.php' -o -name 'config.php' \
@@ -4424,6 +4522,7 @@ SECRET_FILES="$( {
         -o -name 'docker-compose*.y*ml' -o -name 'Dockerfile*' -o -name '.netrc' -o -name '.pgpass' \
         -o -name '.my.cnf' -o -name '.npmrc' -o -name '.git-credentials' -o -name '*.tfvars' \) -print 2>/dev/null
   done
+  IFS=$_oifs
   ls -1 "$LSA_ROOT"/etc/systemd/system/*.service "$LSA_ROOT"/etc/systemd/system/*/*.service 2>/dev/null
   ls -1 "$LSA_ROOT"/etc/cron.d/* 2>/dev/null
 } | sort -u | head -600 )"
@@ -4441,7 +4540,9 @@ printf '%s\n' "$SECRET_FILES" | while IFS= read -r f; do
   m="$(stat -c '%a %U:%G' "$f" 2>/dev/null)"
   scope=""
   case "${m%% *}" in *[4567]) scope=" WORLD-READABLE" ;; esac
+  _oifs=$IFS; IFS=$'\n'
   for dr in $DOCROOTS; do case "$f" in "$dr"/*) scope="$scope IN-DOCUMENT-ROOT" ;; esac; done
+  IFS=$_oifs
   printf '\n[%s] %s%s\n' "$f" "$m" "$scope"
   printf '%s\n' "$HITS" | grep -v '^$' | while IFS= read -r line; do emit_secret "$f" "$line" "key-name"; done
   printf '%s\n' "$TOKHITS" | grep -v '^$' | while IFS= read -r line; do
@@ -4469,11 +4570,13 @@ NSEC="$(printf '%s' "$SECFILES_HIT" | grep -c .)"
 NWORLD="$(printf '%s\n' "$SECFILES_HIT" | while IFS= read -r f; do [ -n "$f" ] || continue
   m="$(stat -c '%a' "$f" 2>/dev/null)"; case "$m" in *[4567]) echo x ;; esac; done | grep -c x)"
 NWEB=0
+_oifs=$IFS; IFS=$'\n'
 for dr in $DOCROOTS; do
   [ -n "$dr" ] || continue
   n="$(printf '%s\n' "$SECFILES_HIT" | grep -c "^$dr/")"
   NWEB=$((NWEB + n))
 done
+IFS=$_oifs
 
 if [ "${NSEC:-0}" -gt 0 ]; then
   chk secrets.cleartext WARN "${NSEC} file(s) contain credential-shaped assignments" "cleartext credentials on disk are normal for application config, so the finding is not their existence — it is their READABILITY and REUSE. Confirm each file is 0600/0640 and owned correctly, that the credential is unique to this host, and that it is not also in git history or a backup"
@@ -4486,11 +4589,11 @@ fi
 # ---- credentials in places people forget ----
 raw "credentials in systemd units, cron, and shell environment"
 grep -rhE '^\s*Environment=.*(PASS|SECRET|TOKEN|KEY)' "$(rf /etc/systemd/system/)" "$(rf /lib/systemd/system/)" 2>/dev/null \
-  | sed 's/=\([^=]*\)$/=<redacted>/' | head -10
+  | redact_env | cap 10
 grep -rhE '(PASS|SECRET|TOKEN|API_?KEY)[[:space:]]*=' "$(rf /etc/environment)" "$(rf /etc/profile)" "$(rf /etc/profile.d/)" 2>/dev/null \
-  | sed 's/=.*/=<redacted>/' | head -10
+  | sed 's/=.*/=<redacted>/' | cap 10
 grep -rhE 'curl[^|]*-u[[:space:]]|--password|MYSQL_PWD|PGPASSWORD' "$(rf /etc/cron.d/)" "$(rf /etc/crontab)" 2>/dev/null \
-  | sed 's/\(-u\|--password\|=\)[[:space:]]*[^[:space:]]*/\1 <redacted>/g' | head -10
+  | sed 's/\(-u\|--password\|=\)[[:space:]]*[^[:space:]]*/\1 <redacted>/g' | cap 10
 if grep -rqE '^\s*Environment=.*(PASS|SECRET|TOKEN|KEY)' "$(rf /etc/systemd/system/)" 2>/dev/null; then
   chk secrets.systemd_env FAIL "credentials in unit Environment= lines" "unit files are world-readable by default, and 'systemctl show' exposes these values to any local user. Use EnvironmentFile= pointing at a 0600 file, or a credential store (LoadCredential=)"
 fi
@@ -4510,6 +4613,7 @@ KEYCAND="$(find "$(rf /var/www)" "$(rf /srv)" "$(rf /opt)" "$(rf /etc/ssl)" "$(r
       -o -name 'id_ed25519*' -o -name '*.p12' -o -name '*.pfx' -o -name 'privkey*' -o -name 'server.key' \) \
    -print 2>/dev/null | head -80)"
 KEYLIST=""; BADKEY=""; PLAINKEY=""
+_oifs=$IFS; IFS=$'\n'
 for k in $KEYCAND; do
   case "$k" in *.pub) continue ;; esac
   HDR="$(head -3 "$k" 2>/dev/null)"
@@ -4530,6 +4634,7 @@ for k in $KEYCAND; do
     *) BADKEY="$BADKEY $k(${m%% *})" ;;
   esac
 done
+IFS=$_oifs
 [ -n "$PLAINKEY" ] && chk secrets.unencrypted_keys INFO "$PLAINKEY" "private keys with no passphrase — usable the instant they are copied. Normal for service/automation keys, but it means file permissions and backup handling are the only protection"
 if [ -n "$BADKEY" ]; then
   chk secrets.private_keys FAIL "$BADKEY" "PEM private key readable beyond its owner — a key readable by the web worker or by any local account should be treated as already disclosed"
@@ -4537,16 +4642,18 @@ elif [ -n "$KEYLIST" ]; then
   chk secrets.private_keys PASS "$(printf '%s' "$KEYLIST" | wc -w | tr -d ' ') private key file(s), permissions correct" ""
 fi
 # a private key inside a document root is downloadable
+_oifs=$IFS; IFS=$'\n'
 for k in $KEYLIST; do
   for dr in $DOCROOTS; do
     [ -n "$dr" ] || continue
     case "$k" in "$dr"/*) chk "secrets.key_in_webroot.$(basename "$k")" FAIL "$k" "private key inside the document root — request it over HTTP to confirm, then rotate it" ;; esac
   done
 done
+IFS=$_oifs
 
 # ---- git history and backups: where deleted secrets keep living ----
 raw "git repositories in served or system paths (history retains removed secrets)"
-find "$(rf /var/www)" "$(rf /srv)" "$(rf /opt)" -maxdepth 4 -type d -name '.git' -print 2>/dev/null | head -10
+find "$(rf /var/www)" "$(rf /srv)" "$(rf /opt)" -maxdepth 4 -type d -name '.git' -print 2>/dev/null | cap 10
 for g in $(find "$(rf /var/www)" "$(rf /srv)" "$(rf /opt)" -maxdepth 4 -type d -name '.git' -print 2>/dev/null | head -5); do
   d="$(dirname "$g")"
   printf '  [%s]\n' "$d"
@@ -4570,7 +4677,7 @@ find $DOCROOTS "$(rf /etc)" -maxdepth 4 -type f \( -name '*.bak' -o -name '*.sav
 sec IMAGE_HYGIENE
 static_on
 
-MID=/etc/machine-id
+MID="$(rf /etc/machine-id)"
 MID_SIZE=0; [ -f "$MID" ] && MID_SIZE="$(wc -c < "$MID" 2>/dev/null | tr -d ' ')"
 raw "instance identity"
 ls -l "$MID" "$(rf /var/lib/dbus/machine-id)" 2>/dev/null
@@ -4677,7 +4784,7 @@ done
 if [ "${MID_SIZE:-0}" -le 1 ]; then
   [ -s "$(rf /root/.bash_history)" ] && chk image.build_history WARN "/root/.bash_history is non-empty in a template" "the image build session's commands ship with it — frequently including credentials typed on the command line"
   [ -d "$(rf /var/lib/cloud/instance)" ] && chk image.cloudinit_state FAIL "/var/lib/cloud state present in a template" "cloud-init thinks it has already run, so it will SKIP first-boot tasks including host-key regeneration. Clean with 'cloud-init clean --logs --seed' before capturing the image"
-  LOGSZ="$(du -sk /var/log 2>/dev/null | awk '{print $1}')"
+  LOGSZ="$(du -sk "$(rf /var/log)" 2>/dev/null | awk '{print $1}')"
   [ "${LOGSZ:-0}" -gt 10240 ] && chk image.logs_in_image WARN "/var/log is ${LOGSZ}KB in a template" "build logs ship with the image and often contain hostnames, IPs and credentials from the build environment"
 fi
 method_reset
@@ -4715,7 +4822,7 @@ else
   # ---- what is actually loaded ----
   if have bpftool && [ "$AM_ROOT" = "1" ]; then
     raw "loaded eBPF programs (bpftool prog list)"
-    run bpftool prog list 2>/dev/null | head -60
+    run bpftool prog list 2>/dev/null | cap 60
     PROGS="$(bpftool prog list 2>/dev/null)"
     NPROG="$(printf '%s\n' "$PROGS" | grep -cE '^[0-9]+:')"
     chk ebpf.programs_loaded INFO "${NPROG:-0} program(s) loaded" "attribute each to a known agent; anything unaccounted for is the finding"
@@ -4729,9 +4836,9 @@ else
     ORPH="$(printf '%s\n' "$PROGS" | grep -E '^[0-9]+:' | grep -vc 'pids ')"
     [ "${ORPH:-0}" -gt 0 ] && chk ebpf.orphan_programs WARN "${ORPH} program(s) with no listed owning process" "a program stays loaded after its loader exits if it is pinned or still attached. Normal for CNI and systemd; for anything else it is persistence without a process to notice"
     raw "eBPF maps"
-    run bpftool map list 2>/dev/null | head -30
+    run bpftool map list 2>/dev/null | cap 30
     raw "cgroup-attached programs"
-    run bpftool cgroup tree 2>/dev/null | head -20
+    run bpftool cgroup tree 2>/dev/null | cap 20
     raw "BPF LSM programs (can enforce policy — or subvert it)"
     printf '%s\n' "$PROGS" | grep -E '^[0-9]+: lsm' | sed 's/^/  /'
     printf '%s' "$PROGS" | grep -qE '^[0-9]+: lsm' && chk ebpf.lsm_programs WARN "BPF LSM programs attached" "these participate in security decisions. Defensive tools (Falco, Tetragon, Tracee) use them legitimately; an attacker uses them to approve their own actions. Attribute every one"
@@ -4882,7 +4989,7 @@ else
         chk "docker.image_secret.$(printf '%s' "$img" | tr '/:' '__')" FAIL "$img" "a credential appears in an image layer. Layers are immutable and distributed with the image, so deleting the file in a later layer does NOT remove it — anyone who can pull the image can read it. Rebuild with BuildKit secret mounts and rotate the credential"; }
     done
     raw "images in use: pinned by digest, or floating?"
-    docker ps --format '{{.Image}}' 2>/dev/null | sort -u | sed 's/^/  /' | head -15
+    docker ps --format '{{.Image}}' 2>/dev/null | sort -u | sed 's/^/  /' | cap 15
     docker ps --format '{{.Image}}' 2>/dev/null | grep -qv '@sha256:' && \
       chk docker.image_pinning WARN "images referenced by tag, not digest" "a tag is mutable: the image you audited is not necessarily the image that runs after the next pull. Pin by @sha256: digest for anything security-relevant"
   elif [ "$OFFLINE" = "1" ]; then
@@ -4960,13 +5067,13 @@ else
 
   # --- host filesystem mounted in ---
   raw "mounts from the host"
-  grep -vE ' (overlay|tmpfs|proc|sysfs|cgroup|cgroup2|devpts|mqueue|shm|securityfs|pstore|bpf|debugfs|tracefs|configfs|fusectl|nsfs) ' /proc/mounts 2>/dev/null | head -20
+  grep -vE ' (overlay|tmpfs|proc|sysfs|cgroup|cgroup2|devpts|mqueue|shm|securityfs|pstore|bpf|debugfs|tracefs|configfs|fusectl|nsfs) ' /proc/mounts 2>/dev/null | cap 20
   for hm in /host /hostfs /rootfs; do
     [ -d "$hm" ] && chk "container.host_mount$hm" FAIL "$hm present" "the host filesystem is mounted into the container"
   done
   grep -qE '^\S+ /etc/(passwd|shadow|ssh) ' /proc/mounts 2>/dev/null && chk container.host_sensitive_mount FAIL "host /etc file bind-mounted" "host credential files are exposed to the container"
   # writable host paths are the escape route that survives everything else
-  awk '$2 !~ /^\/(proc|sys|dev|run|etc\/host|etc\/resolv)/ && $4 ~ /(^|,)rw(,|$)/ {print "  rw: "$2" ("$3")"}' /proc/mounts 2>/dev/null | head -15
+  awk '$2 !~ /^\/(proc|sys|dev|run|etc\/host|etc\/resolv)/ && $4 ~ /(^|,)rw(,|$)/ {print "  rw: "$2" ("$3")"}' /proc/mounts 2>/dev/null | cap 15
   ROFS=0
   awk '$2=="/" && $4 ~ /(^|,)ro(,|$)/ {found=1} END{exit !found}' /proc/mounts 2>/dev/null && ROFS=1
   [ "$ROFS" = "1" ] && chk container.readonly_rootfs PASS "root filesystem is read-only" "" \
@@ -4983,7 +5090,7 @@ else
   raw "shells and interpreters in the image"
   for sh in bash sh dash ash python3 perl ruby node; do have "$sh" && printf '  %s ' "$sh"; done; echo
   raw "credentials in the container environment (values redacted)"
-  tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -iE '(PASS|SECRET|TOKEN|KEY|CRED)' | sed 's/=.*/=<redacted>/' | head -10
+  tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -iE '(PASS|SECRET|TOKEN|KEY|CRED)' | sed 's/=.*/=<redacted>/' | cap 10
   tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -ciE '(PASS|SECRET|TOKEN|KEY|CRED)' | while read -r n; do
     [ "${n:-0}" -gt 0 ] && chk container.env_secrets FAIL "${n} credential-shaped environment variable(s)" "environment variables are readable via /proc/<pid>/environ by anything in the container, are captured in 'docker inspect', and are baked into image metadata if set with ENV. Use a mounted secret or a secrets manager"
   done
@@ -5284,6 +5391,7 @@ if [ -n "$LSA_TALLY" ] && [ -s "$LSA_TALLY" ]; then
   awk '
     $1=="V" { st[$2]++; me[$3]++; tot++ }
     $1=="S" { sect[$2]=$3 }
+    $1=="T" { trunc++ }
     END {
       printf "checks_total=%d\n", tot
       printf "verdicts=PASS %d, FAIL %d, WARN %d, INFO %d, NA %d\n",
@@ -5296,6 +5404,7 @@ if [ -n "$LSA_TALLY" ] && [ -s "$LSA_TALLY" ]; then
       # NA share is the headline number for collection quality: it is what the run could not
       # determine, and it must never be read as compliance.
       if (tot > 0) printf "undetermined_pct=%.0f%%\n", 100*st["NA"]/tot
+      printf "truncated_lists=%d\n", trunc+0
       n=0
       for (s in sect) { n++; order[n]=s }
       for (i=1;i<=n;i++) for (j=i+1;j<=n;j++)

@@ -2,5 +2,27 @@
   "name": "linux-security-audit",
   "version": "1.4.0",
   "description": "Audit a Linux host's security hardening posture and produce a risk-ranked report, using both passive config inspection and active service probing. Runs against a live host, a mounted image (--root), or a container.",
-  "author": { "name": "Jonas Lejon", "url": "https://github.com/jonaslejon" }
+  "author": {
+    "name": "Jonas Lejon",
+    "url": "https://github.com/jonaslejon"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/jonaslejon/linux-security-audit-plugin",
+  "repository": "https://github.com/jonaslejon/linux-security-audit-plugin",
+  "keywords": [
+    "linux",
+    "security",
+    "hardening",
+    "audit",
+    "cis",
+    "stig",
+    "sysctl",
+    "selinux",
+    "ssh",
+    "tls",
+    "ebpf",
+    "docker",
+    "compliance",
+    "golden-image"
+  ]
 }
