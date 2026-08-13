@@ -9,6 +9,48 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.6.0] — 2026-08-13
+
+Changes to the skill layer, driven by what auditing six real images actually required.
+
+### Added
+
+- **A verification step before reporting.** The rules now say to confirm a `FAIL` against the
+  system rather than copy it into a report, and the Analyse section carries a table of the check
+  classes that misfire with a one-command test for each: permissions on paths that may be symlinks,
+  "X is not installed" claims, counts taken from a command's output, credential matches on
+  commented-out lines or public key material, modes that are stricter rather than wrong, and
+  group-readable homes with a per-user private group. Every one of those is a false positive found
+  and fixed in the last two days; none was caught by the tool itself. It also says to report a
+  misfiring check upstream instead of quietly dropping it.
+- **Triage guidance for container reports.** Findings are split into image (fix in the Dockerfile),
+  deployment (fix in the compose/swarm/k8s manifest, not a defect in the image) and host or
+  orchestrator, with the check IDs in each group. "Your image runs as root" and "your deployment
+  does not set no_new_privs" go to different people and different files.
+- **`system.base_os` and `system.base_os_eol`.** Base OS and release are reported as one comparable
+  string, because drift between images that should share a base is otherwise invisible: of three
+  images audited together, two were Debian 13 and one was Debian 12, and nothing said so. End of
+  life is established from evidence first (a repository pointing at `archive.debian.org`,
+  `old-releases.ubuntu.com` or `vault.centos.org` is proof the release is past support, so `FAIL`),
+  falling back to a dated table that reports `WARN` and prints its own as-of date, because a date
+  table is stale the day it ships and asserting support status from memory is the same error as
+  asserting a CIS control number from memory.
+
+### Fixed
+
+- **The documented way to audit an image did not work.** `docker run --rm -i <image> bash -s`
+  passes `bash` as an argument to the image's own `ENTRYPOINT`, which usually rejects it **and
+  exits 0**, so the caller sees success and a report full of that program's usage text. It failed
+  on every image tested. Now uses `--entrypoint bash --network none` and `--passive`, with the
+  `docker exec` form documented alongside for auditing a running workload.
+
+### Changed
+
+- **Background moved out of `SKILL.md`.** Complementary tooling, the CIS/STIG relationship and the
+  comparison against Lynis and linPEAS are now `references/tooling-and-scope.md`, loaded on demand.
+  The claim that this is not a compliance tool stays inline, since it constrains how every report
+  is written. The method-model explanation is condensed to the part that changes behaviour.
+
 ## [1.5.3] — 2026-08-13
 
 Found by auditing the official `debian:latest` and `ubuntu:latest` images.

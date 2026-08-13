@@ -176,6 +176,8 @@ sysctl.vm.mmap_rnd_bits
 sysctl.vm.mmap_rnd_compat_bits
 sysctl.vm.swappiness
 sysctl.vm.unprivileged_userfaultfd
+system.base_os
+system.base_os_eol
 time.authenticated
 time.server_exposed
 time.sources

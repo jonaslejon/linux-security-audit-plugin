@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
-LSA_VERSION="1.5.3"
+LSA_VERSION="1.6.0"
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -434,6 +434,51 @@ printf 'quick_mode=%s\n' "$QUICK"
 sec SYSTEM
 raw "os-release"
 [ -r "$(rf /etc/os-release)" ] && cat "$(rf /etc/os-release)"
+# Provenance, emitted as a single comparable string. Drift between images that are supposed to
+# share a base is invisible until you line them up: two of three images audited on the same day
+# were Debian 13 and the third was Debian 12, which nothing in the report surfaced.
+static_on   # both read files from the tree, so they work against a mounted image
+OSID="$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2; exit}' "$(rf /etc/os-release)" 2>/dev/null)"
+OSVER="$(awk -F= '/^VERSION_ID=/{gsub(/"/,"",$2); print $2; exit}' "$(rf /etc/os-release)" 2>/dev/null)"
+if [ -n "$OSID" ]; then
+  chk system.base_os INFO "${OSID}-${OSVER:-unknown}" "quote this when comparing images or hosts that are supposed to be identical; a base-image difference explains findings that otherwise look like drift"
+else
+  chk system.base_os NA "no /etc/os-release" "the distribution and release could not be identified"
+fi
+
+# End-of-life, established from EVIDENCE rather than a date table. A hardcoded EOL list is wrong
+# the moment it goes stale, and asserting "this release is unsupported" from memory is the same
+# error as asserting a CIS control number from memory. What IS observable: the distributions move
+# past-EOL releases to a different host, so a repository pointing there is proof, not a guess.
+EOLEV="$( { cat "$(rf /etc/apt/sources.list)" 2>/dev/null
+            cat "$LSA_ROOT"/etc/apt/sources.list.d/*.list "$LSA_ROOT"/etc/apt/sources.list.d/*.sources 2>/dev/null
+            cat "$LSA_ROOT"/etc/yum.repos.d/*.repo 2>/dev/null; } \
+          | grep -ioE '(archive\.debian\.org|old-releases\.ubuntu\.com|vault\.centos\.org|vault\.almalinux\.org)' | sort -u | tr '\n' ' ')"
+if [ -n "$EOLEV" ]; then
+  chk system.base_os_eol FAIL "repositories point at ${EOLEV}" "distributions move a release to these hosts once it stops receiving security updates, so this is direct evidence the base is past end of life. No patch is coming for any CVE in it: rebuild on a supported release"
+else
+  # No archive evidence. Fall back to a dated table, reported as WARN and never FAIL, because a
+  # date table is stale the day it ships. The as-of date is printed so a reader can judge how much
+  # to trust it, and the instruction is to verify rather than to act on this alone. This is the
+  # same reasoning that keeps CIS control numbers out of the output: state the basis, or say NA.
+  EOL_ASOF="2026-08"
+  EOLTAB=""
+  case "${OSID}-${OSVER%%.*}" in
+    debian-8|debian-9|debian-10)                   EOLTAB="Debian ${OSVER}" ;;
+    ubuntu-14|ubuntu-16|ubuntu-18|ubuntu-19|ubuntu-21|ubuntu-23) EOLTAB="Ubuntu ${OSVER}" ;;
+    centos-6|centos-7|centos-8)                    EOLTAB="CentOS ${OSVER}" ;;
+    rhel-6|rhel-7)                                 EOLTAB="RHEL ${OSVER}" ;;
+  esac
+  case "${OSID}-${OSVER}" in
+    ubuntu-20.04) EOLTAB="Ubuntu 20.04 (standard support ended; security updates require Ubuntu Pro/ESM)" ;;
+  esac
+  if [ -n "$EOLTAB" ]; then
+    chk system.base_os_eol WARN "${EOLTAB} is past end of standard support (as of ${EOL_ASOF})" "no archived-release repository is configured, so this is from the collector's own table rather than from evidence on the host, and that table goes stale. Confirm against the vendor lifecycle page before acting. If it is correct, no patch is coming for any CVE in this base and the fix is a rebuild, not a package update"
+  else
+    chk system.base_os_eol PASS "no archived-release repositories configured" "this shows the release has not been moved to an archive host, and it is not in the collector's table of releases known past support as of ${EOL_ASOF}. Neither is proof of support: check the vendor's lifecycle page for ${OSID:-this distribution} ${OSVER:-}"
+  fi
+fi
+method_reset
 raw "kernel"
 uname -a
 raw "virtualisation / platform"

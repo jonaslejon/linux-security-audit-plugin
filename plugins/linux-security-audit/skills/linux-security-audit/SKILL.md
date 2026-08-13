@@ -70,6 +70,12 @@ reason not to.
    "test before you commit" step. See `references/remediation.md` → *Lockout-risk changes*.
 6. **A missing control is a finding, not a failure of the machine.** Report what is true; state
    privilege limits plainly (a non-root run reports `NA`, which is not `PASS`).
+7. **Confirm a finding before you report it.** The collector is a script, not an oracle. Spend one
+   command checking a `FAIL` against the system rather than copying it into a report, because the
+   cost of a manufactured finding is not the wasted hour, it is that the next real finding gets
+   ignored. This is the single most productive habit when using this skill: it is how essentially
+   every defect in the tool has been found. See *Verifying a finding* below for the classes that
+   misfire and how to check each one.
 
 ## Workflow
 
@@ -106,9 +112,19 @@ ssh -p <port> <user>@<host> 'sudo bash -s -- ' < "$SK" > "$OUT"
 # without sudo (many checks degrade to NA — say so in the report)
 ssh -p <port> <user>@<host> 'bash -s' < "$SK" > "$OUT"
 
-# container / image
-docker run --rm -i <image> bash -s < "$SK" > "$OUT"
+# container image. --entrypoint is required: without it, `bash` is passed as an ARGUMENT to the
+# image's own entrypoint, which usually rejects it and exits 0, so you get a success and a report
+# full of that program's usage text. --network none keeps the audit off the network.
+docker run --rm -i --entrypoint bash --network none <image> -s -- --passive < "$SK" > "$OUT"
+
+# a RUNNING container (its posture, not just its image)
+docker exec -i <container> bash -s -- --passive < "$SK" > "$OUT"
 ```
+
+The collector reports which of those two it is in `container.context`. Running an image gives an
+*inspection* container: seccomp, `no_new_privs`, rootfs mode and namespaced sysctls then describe
+the container you just started, not the image, so they report `NA`. Use `docker exec` against a
+real workload when you need those.
 
 ```bash
 # golden image / ISO / unbooted system — mount it and point --root at the mountpoint
@@ -145,25 +161,13 @@ The run's actual distribution is printed in the output header (`method_counts=`)
 elapsed time and per-section timings. Quote those numbers in the report rather than any figure from
 this file, which will drift as checks are added.
 
-Some controls are visible on **both** sides — a sysctl has a value in `/proc/sys` and an assignment
-in `/etc/sysctl.d`. The `DRIFT` section compares them and reports the *direction* of any
-disagreement: `RUNTIME-ONLY` (applied but not persisted — reverts at reboot) or `CONFIG-ONLY`
-(persisted but never applied — the file reads as compliant while the kernel disagrees). Read that
-section before trusting any other PASS, because it is exactly where a config-based audit and a
-runtime-based audit reach opposite conclusions.
-
-The three-way split matters because **"not active" does not mean "works offline"**. Most of the
-check set needs a booted system. When auditing an image, expect only the `static` share to produce
-verdicts, and say so in the report rather than presenting a thin pass list as full coverage.
-
-Some things **cannot** be established passively, and saying otherwise would be wrong: which cipher
-suites and protocol versions a server actually negotiates (that depends on the TLS library build
-and the distro crypto policy, not only the config), and whether a client-certificate requirement is
-genuinely *enforced* versus merely requested. When you run with `--passive`, say so in the report
-and mark those as unverified rather than passing.
-
-A useful pattern for a fleet: audit the image passively at build time, then audit the running host
-actively — a delta between them is configuration drift after deploy.
+**"Not active" does not mean "works offline."** Most of the check set needs a booted system, so an
+image audit produces verdicts only for the `static` share. Say that in the report rather than
+presenting a thin pass list as full coverage. Two consequences worth knowing: the `DRIFT` section
+compares persisted config against running kernel and reports which way they disagree, so read it
+before trusting any other `PASS`; and TLS cipher/protocol negotiation and genuine mutual-TLS
+*enforcement* cannot be established from config at all, so under `--passive` mark those unverified
+rather than passing. Both are covered in `references/checklist.md` and `references/tls-and-mtls.md`.
 
 Always save raw output to a working directory and cite line numbers from it as evidence. Multiple
 hosts: collect them all first, then compare — drift between supposedly-identical hosts is itself
@@ -194,6 +198,42 @@ routers/NAT gateways/container hosts), `accept_ra=0` (breaks SLAAC-configured ho
 Consult the reference files for anything you are not certain about rather than guessing at what a
 value means — several of these settings mean different things on different distros and kernel
 versions (see `references/sysctl.md` → *Distro and version traps*).
+
+### Verifying a finding
+
+Before a `FAIL` or `WARN` goes in the report, confirm it. Some check classes misfire in ways that
+look exactly like real findings, and each has a one-command test:
+
+| Finding looks like | Why it misfires | Confirm with |
+|---|---|---|
+| A permission on `/bin`, `/sbin`, `/lib` or any path that may be a symlink | Every symlink is mode 0777; a check that does not dereference reports the link, not the target | `ls -ld <path>; stat -L -c '%a %U:%G' <path>`, then actually try to write as a non-root user |
+| "X is not installed" or "no Y configured" | The tool may be looking on the wrong machine (offline mode), or the subsystem may not exist in this context at all | `command -v X` on the target itself; check `container.context` and whether the section should be `NA` here |
+| A count taken from a command's output | An error message on the command's output stream gets counted as data | Re-run the command by hand and look at what it actually printed |
+| A secret or credential | Key-name matching hits commented-out examples and public key material (a `GPG_KEY` in a base image is a published fingerprint, not a secret) | Open the file at the reported line. Is the line commented? Is the value a public fingerprint or digest? |
+| A file mode reported as wrong | Stricter-than-expected modes are sometimes flagged because a check lists exact values instead of a rule (`0` is `000`, and `0550` is stricter than `0700`) | Reason about who actually gains access, not whether the mode matches a template |
+| Anything about users, groups or homes | Group-readable is not exposure when the group is the user's own private group with no other members | `stat -c '%U %G' <home>; getent group <group>` |
+
+If a check is wrong, say so in the report instead of quietly dropping it (silence teaches the
+reader nothing), and open an issue at the repository. A misfiring check that nobody reports stays
+misfiring for everyone.
+
+### Triaging a container or image report
+
+Findings from a container fall into three groups, and saying which is most of the value:
+
+- **Image** — fixed in the `Dockerfile` and shipped by a rebuild: `container.runs_as_root` (add a
+  `USER`), `container.suid_binaries`, `container.env_secrets`, `repo.*`, `packages.*`,
+  `system.base_os*`, `perm.*`, `secrets.*`.
+- **Deployment** — fixed in the compose file, swarm service or pod spec, and *not* defects in the
+  image: `container.no_new_privs`, `container.readonly_rootfs`, `container.mac`,
+  `container.privileged`, `container.seccomp`, and every namespaced `sysctl.*`. When the collector
+  ran in inspection mode these are `NA`, because they described the container you started to read
+  the image with.
+- **Host or orchestrator** — reported `NA` with the reason: mount layout, firewall, time sync,
+  auditd, remote logging, kernel currency, and the interactive-login family.
+
+Say plainly which group each finding is in. "Your image runs as root" and "your deployment does not
+set `no_new_privs`" go to different people and different files.
 
 Then look for what the collector cannot judge alone:
 
@@ -271,52 +311,15 @@ Load these on demand, not upfront:
   bpftrace/opensnoop/fatrace), `--unit <name>` (restarts one service), `--boot arm`/`--boot report`
   (temporary auditd rules across a reboot). Not run automatically — the last two are disruptive.
 - `assets/report-template.md` — report structure.
+- `references/tooling-and-scope.md` — what else to run alongside (Lynis, OpenSCAP, `testssl.sh`,
+  `kernel-hardening-checker`), the relationship to CIS and STIG, how this differs from Lynis and
+  linPEAS, and the known coverage gaps to name in a report's *Not assessed* section.
 
-## Complementary tooling
-
-The collector is deliberately dependency-free. When deeper coverage is wanted and the user agrees
-to install tooling, suggest: `lynis audit system` (broad, opinionated, no agent),
-`oscap`/OpenSCAP with a CIS or STIG datastream (formal compliance evidence),
-`ssh-audit` and `testssl.sh` (SSH and TLS algorithm grading — both must run from *outside* the
-host to test what is actually offered, which a config read cannot establish),
-[`kernel-hardening-checker`](https://github.com/a13xp0p0v/kernel-hardening-checker) (kernel
-`CONFIG_*` vs KSPP — the one thing the collector genuinely cannot cover, since it inspects build
-config), `debsecan` / `dnf updateinfo` (CVE exposure of installed packages), `debsums` / `rpm -Va`
-(verify installed files against their packages), and `systemd-analyze security` (already sampled by
-the collector).
-
-### Relationship to CIS and STIG
-
-Strong technical overlap, but **this is not a compliance tool and must not be presented as one** —
-it emits no control IDs, and no check should ever be labelled with a CIS or STIG number (numbering
-varies by benchmark version and distro; asserting one from memory would be wrong too often). For
-compliance *evidence*, use OpenSCAP with the real datastream and run this alongside for what a
-benchmark does not model. Full comparison in `references/checklist.md`.
-
-### Where this sits relative to the well-known tools
-
-The check set was diffed against [Lynis](https://github.com/CISOfy/lynis)'s `tests.db`,
-[linux-smart-enumeration](https://github.com/diego-treitos/linux-smart-enumeration),
-[LinEnum](https://github.com/rebootuser/LinEnum)/linPEAS, and the CIS benchmarks. Deliberate
-differences:
-
-- **Lynis** is broader on platform coverage (BSD/Solaris/AIX/macOS) and on service inventory
-  (Squid, CUPS, printers, mail, LDAP, DNS). It reports mostly *suggestions* without exploitability
-  ranking, and it does not actively probe TLS ciphers or mutual-TLS enforcement. Run it alongside
-  for breadth; it is packaged, agentless and fast.
-- **linPEAS / LSE** are attacker-perspective and unprivileged-user oriented; they enumerate what
-  the *current user* can escalate through. The `PRIVESC_PATHS` section here covers the same ground
-  from the defender's side (whole-host, with root), but they will find user-context things this
-  does not — running tmux/screen sessions, ssh-agent sockets, cached Kerberos tickets, credentials
-  in running process command lines.
-- **CIS / OpenSCAP** produce formal, numbered compliance evidence with a pass/fail per control.
-  Use `oscap` with a CIS datastream when the deliverable is an audit artifact rather than a
-  prioritised fix list.
-
-Known gaps in this skill, worth naming in a report's *Not assessed* section: kernel `CONFIG_*`
-build options, mail/DNS/print/proxy server hardening beyond exposure, BSD and Solaris,
-user-context credential theft (agent sockets, tmux, Kerberos), and anything requiring an external
-vantage point (`testssl.sh`, `ssh-audit`, external port scan).
+**This is not a compliance tool and must not be presented as one.** It emits no control IDs, and
+no check should be labelled with a CIS or STIG number: numbering varies by benchmark version and
+distro, so asserting one from memory would be wrong too often. Use OpenSCAP with a real datastream
+when the deliverable is an audit artifact. Details, and the comparison to other tools, are in
+`references/tooling-and-scope.md`.
 
 ## Where this skill lives
 
