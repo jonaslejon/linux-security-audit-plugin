@@ -9,6 +9,27 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.4.1] — 2026-08-13
+
+Three false positives found by running the collector against real Docker images.
+
+### Fixed
+
+- **`privesc.path` reported `/bin` and `/sbin` as world-writable on every merged-`/usr` system.**
+  A symlink is always mode 0777, and the PATH loop stat'd without `-L`, so Debian and Ubuntu (where
+  `/bin -> usr/bin`) produced a `FAIL` reading "a writable PATH element lets an attacker place a
+  binary that a higher-privileged user then executes by name". The real directories are 0755
+  root:root and writes are denied. The same symlink bug was fixed in `path_risk` and the `find`
+  scans in an earlier release; this call site was missed, and it is the one that renders as a
+  privilege-escalation path at the top of a report.
+- **`container.env_secrets` flagged public key material as a credential.** The official Python and
+  Node base images set `GPG_KEY` to the OpenPGP fingerprint used to verify the source tarball, and
+  `*_SHA256` to a published digest. Both are public by design. Matching on the variable name alone
+  reported them as leaked secrets; bare hex fingerprints and digests are now excluded on value shape.
+- **`packages.auto_updates` recommended unattended-upgrades inside container images.** The image is
+  immutable and the container is replaced on the next deploy, so in-place patching is the wrong
+  control: it belongs to the rebuild pipeline. Now `NA` in a container context with that reasoning.
+
 ## [1.4.0] — 2026-08-13
 
 Offline mode did not work. `--root` was wired into two sections and nowhere else, so 270 of the

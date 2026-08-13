@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
-LSA_VERSION="1.4.0"
+LSA_VERSION="1.4.1"
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -2611,8 +2611,12 @@ if have dpkg-query; then
                          || chk packages.security_updates PASS "0 security / ${PEND:-0} total pending" ""
   raw "unattended-upgrades"
   [ -r "$(rf /etc/apt/apt.conf.d/20auto-upgrades)" ] && cat "$(rf /etc/apt/apt.conf.d/20auto-upgrades)"
+  if [ -n "$CTR" ]; then
+    chk packages.auto_updates NA "container image" "in-place auto-patching is the wrong control for an image: the container is replaced on the next deploy, so patching belongs to the rebuild pipeline and a base-image refresh, not to unattended-upgrades inside the image"
+  else
   grep -rqs 'Unattended-Upgrade::Allowed-Origins\|Origins-Pattern' "$(rf /etc/apt/apt.conf.d/50unattended-upgrades)" 2>/dev/null \
     && chk packages.auto_updates PASS configured "" || chk packages.auto_updates WARN "not configured" "security patches are not applied automatically"
+  fi
   raw "apt sources using plain http"
   grep -rhE '^\s*(deb|URIs)' "$(rf /etc/apt/sources.list)" "$(rf /etc/apt/sources.list.d/)" 2>/dev/null | grep -c 'http://' | sed 's/^/http_sources=/'
   raw "apt sandbox"
@@ -3811,7 +3815,9 @@ for d in $PATH; do
   esac
   [ -d "$d" ] || continue
   if [ -w "$d" ] && [ "$AM_ROOT" != "1" ]; then BADPATH="$BADPATH [writable:$d]"; fi
-  P="$(stat -c '%a %U' "$d" 2>/dev/null)"
+  # -L: a symlink is always mode 0777, so without dereferencing, merged-/usr systems report
+  # /bin and /sbin as world-writable when the real directories are 0755 root:root.
+  P="$(stat -L -c '%a %U' "$d" 2>/dev/null)"
   case "${P%% *}" in *[2367]) BADPATH="$BADPATH [world-writable:$d]" ;; esac
 done
 IFS="$OLDIFS"
@@ -5110,8 +5116,20 @@ else
   raw "shells and interpreters in the image"
   for sh in bash sh dash ash python3 perl ruby node; do have "$sh" && printf '  %s ' "$sh"; done; echo
   raw "credentials in the container environment (values redacted)"
-  tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -iE '(PASS|SECRET|TOKEN|KEY|CRED)' | sed 's/=.*/=<redacted>/' | cap 10
-  tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -ciE '(PASS|SECRET|TOKEN|KEY|CRED)' | while read -r n; do
+  # Name-shaped matching alone is not enough: base images ship GPG_KEY (a public OpenPGP
+  # fingerprint used to verify a source tarball) and *_SHA256 (a published digest). Both are
+  # public by design, so a bare hex fingerprint or digest is excluded on value shape.
+  env_cred() {
+    tr '\0' '\n' < /proc/1/environ 2>/dev/null \
+      | grep -iE '(PASS|SECRET|TOKEN|KEY|CRED)' \
+      | awk -F= '{
+          n=$1; v=$2
+          if (n ~ /(SHA[0-9]+|_DIGEST|_FINGERPRINT|_KEY_?ID|GPG_KEY|PUBKEY)$/ && v ~ /^[0-9A-Fa-f]{32,128}$/) next
+          print
+        }'
+  }
+  env_cred | sed 's/=.*/=<redacted>/' | cap 10
+  env_cred | grep -c . | while read -r n; do
     [ "${n:-0}" -gt 0 ] && chk container.env_secrets FAIL "${n} credential-shaped environment variable(s)" "environment variables are readable via /proc/<pid>/environ by anything in the container, are captured in 'docker inspect', and are baked into image metadata if set with ENV. Use a mounted secret or a secrets manager"
   done
 fi
