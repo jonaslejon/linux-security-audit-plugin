@@ -9,6 +9,24 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.5.3] — 2026-08-13
+
+Found by auditing the official `debian:latest` and `ubuntu:latest` images.
+
+### Fixed
+
+- **A per-user private group is no longer reported as an exposure.** Ubuntu ships `/home/<user>` at
+  0750 with `USERGROUPS_ENAB yes`, so the group is the user's own and has no other members: the
+  home is readable only by its owner. Both `perm.home_dirs` and `perm.home_default` warned about
+  it, which flags the vendor default of the most widely deployed Linux distribution for an exposure
+  that does not exist. The check now resolves the owning group's membership and only reports a home
+  whose group genuinely contains someone else. `HOME_MODE=0750` with `USERGROUPS_ENAB yes` passes,
+  and says plainly that this stops being true the moment another account joins a user's group, so
+  the control to watch is group membership rather than the directory mode.
+
+  CI asserts both directions on real images: stock Ubuntu must pass, and a home `chgrp`'d to a
+  group with two members must still be reported.
+
 ## [1.5.2] — 2026-08-13
 
 The two UBI findings that were flagged as suspect rather than reported. One was a symptom of a

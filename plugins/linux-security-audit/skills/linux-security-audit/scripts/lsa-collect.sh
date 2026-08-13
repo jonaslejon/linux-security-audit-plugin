@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
-LSA_VERSION="1.5.2"
+LSA_VERSION="1.5.3"
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -950,7 +950,20 @@ awk -F: '/^[^#]/ && NF>=7 && $3+0>=1000 && $3+0<65534 && $6!="" && $6!="/" && $6
   done
 # counts in a second pass so they survive the subshell
 HOMES="$(awk -F: '/^[^#]/ && NF>=7 && $3+0>=1000 && $3+0<65534 && $6!="" && $6!="/" {print $6}' "$(rf /etc/passwd)" 2>/dev/null)"
-NOTHER=0; NGROUP=0; NTOT=0
+# priv_group <user> <groupname> — true when the group is that user's own private group, i.e. named
+# after them and with no other members. Debian and Ubuntu both ship USERGROUPS_ENAB yes, so a 0750
+# home is group-readable only by its owner and exposes nothing. Counting that as a finding would
+# flag the vendor default of the two most widely deployed distributions for an exposure that does
+# not exist. It is still a finding the moment somebody else joins the group.
+priv_group() {
+  [ "$1" = "$2" ] || return 1
+  _members="$(awk -F: -v g="$2" '$1==g{print $4}' "$(rf /etc/group)" 2>/dev/null)"
+  case ",${_members}," in
+    ,,|,"$1",) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+NOTHER=0; NGROUP=0; NTOT=0; NPRIV=0
 _oifs=$IFS; IFS=$'\n'
 for h in $HOMES; do
   hp="$(rf "$h")"; [ -d "$hp" ] || continue
@@ -958,13 +971,18 @@ for h in $HOMES; do
   NTOT=$((NTOT+1))
   ot="$(printf '%s' "$m" | sed 's/.*\(.\)/\1/')"; g="$(printf '%s' "$m" | sed 's/.*\(.\)./\1/')"
   [ "$ot" != "0" ] && NOTHER=$((NOTHER+1))
-  [ "$ot" = "0" ] && [ "$g" != "0" ] && NGROUP=$((NGROUP+1))
+  if [ "$ot" = "0" ] && [ "$g" != "0" ]; then
+    _hu="$(stat -L -c '%U' "$hp" 2>/dev/null)"; _hg="$(stat -L -c '%G' "$hp" 2>/dev/null)"
+    if priv_group "$_hu" "$_hg"; then NPRIV=$((NPRIV+1)); else NGROUP=$((NGROUP+1)); fi
+  fi
 done
 IFS=$_oifs
 if [ "$NTOT" = "0" ]; then
   chk perm.home_dirs NA "no home directories found or readable" "undetermined"
 elif [ "$NOTHER" -gt 0 ]; then
   chk perm.home_dirs FAIL "${NOTHER} of ${NTOT} home(s) readable by other users" "every local account — including a compromised service account — can read these users' files: SSH private keys, .bash_history, cloud credential files, application configs. Set 0700 on each, and fix the default below or the next account created repeats it"
+elif [ "$NGROUP" = "0" ] && [ "$NPRIV" -gt 0 ]; then
+  chk perm.home_dirs PASS "${NPRIV} of ${NTOT} home(s) 0750 with a per-user private group" "group-readable, but the group is the owner's own and has no other members, so nothing is exposed. This stops being true the moment another account joins that group, so it is worth an alert on group membership changes rather than a permission change"
 elif [ "$NGROUP" -gt 0 ]; then
   chk perm.home_dirs WARN "${NGROUP} of ${NTOT} home(s) group-readable" "acceptable only if the group is deliberate and its membership is controlled; 0700 otherwise"
 else
@@ -983,7 +1001,12 @@ printf '  login.defs HOME_MODE=%s  login.defs UMASK=%s  adduser.conf DIR_MODE=%s
 if [ -n "$HOMEMODE" ]; then
   case "$HOMEMODE" in
     0700|700) chk perm.home_default PASS "HOME_MODE=$HOMEMODE" "new accounts get a private home" ;;
-    0750|750) chk perm.home_default WARN "HOME_MODE=$HOMEMODE" "new homes are group-readable" ;;
+    0750|750)
+      if [ "$(grep -hiE '^[[:space:]]*USERGROUPS_ENAB' "$(rf /etc/login.defs)" 2>/dev/null | awk '{print tolower($2)}' | tail -1)" = "yes" ]; then
+        chk perm.home_default PASS "HOME_MODE=$HOMEMODE with USERGROUPS_ENAB yes" "useradd gives each account its own group, so a 0750 home is readable only by its owner. This is Ubuntu's default and is equivalent to 0700 in practice, as long as nobody is added to a user's private group"
+      else
+        chk perm.home_default WARN "HOME_MODE=$HOMEMODE, USERGROUPS_ENAB not yes" "new homes are group-readable and accounts share a common group, so every member of that group can read them"
+      fi ;;
     *) chk perm.home_default FAIL "HOME_MODE=$HOMEMODE" "every account created from now on gets a home readable by other users. Set HOME_MODE 0700 in /etc/login.defs" ;;
   esac
 elif [ -n "$LDUMASK" ]; then

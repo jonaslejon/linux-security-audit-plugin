@@ -134,6 +134,35 @@ jobs:
           n=$(grep '^CHECK|' ctr.txt | grep -cvE '\|(PASS|NA|INFO)\|')
           echo "non-PASS findings on a stock debian image: $n"
           [ "$n" -lt 20 ] || { echo "container profile is not suppressing host controls"; exit 1; }
+      # Stock Ubuntu ships /home/<user> at 0750 with a per-user private group and
+      # USERGROUPS_ENAB yes, so it is private in practice. Warning about the vendor default of
+      # the most widely deployed distribution, for an exposure that does not exist, is noise.
+      - name: A per-user private group is not an exposure
+        run: |
+          S=plugins/linux-security-audit/skills/linux-security-audit/scripts/lsa-collect.sh
+          docker run --rm -i --entrypoint bash --network none ubuntu:latest -s -- --passive < "$S" > ubu.txt 2>/dev/null || true
+          grep -E '^CHECK\|perm\.home' ubu.txt || true
+          for id in perm.home_dirs perm.home_default; do
+            v=$(grep "^CHECK|$id|" ubu.txt | cut -d'|' -f3)
+            [ "$v" = "PASS" ] || { echo "$id was '$v' on stock ubuntu; a private group is not an exposure"; exit 1; }
+          done
+      # ...but a genuinely shared group still has to be caught, or the check above is just blind.
+      - name: A shared group is still a finding
+        run: |
+          S=plugins/linux-security-audit/skills/linux-security-audit/scripts/lsa-collect.sh
+          cat > ctl.sh <<'EOS'
+          useradd -m -u 1100 alice >/dev/null 2>&1 || true
+          groupadd shared >/dev/null 2>&1 || true
+          usermod -aG shared alice >/dev/null 2>&1 || true
+          useradd -m -u 1101 bob >/dev/null 2>&1 || true
+          usermod -aG shared bob >/dev/null 2>&1 || true
+          chgrp shared /home/alice && chmod 750 /home/alice
+          bash /tmp/lsa.sh --passive 2>/dev/null | grep '^CHECK|perm.home_dirs|'
+          EOS
+          out=$(docker run --rm -v "$PWD/$S:/tmp/lsa.sh:ro" -v "$PWD/ctl.sh:/tmp/ctl.sh:ro" \
+                  --entrypoint bash --network none ubuntu:latest /tmp/ctl.sh)
+          echo "$out"
+          echo "$out" | grep -q '|WARN|' || { echo "a shared-group home was not reported"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
