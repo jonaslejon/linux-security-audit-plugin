@@ -24,6 +24,11 @@ USB lockdown is now scored against the machine it is being audited on.
   `xen,xenvm`, so those are matched first; the Xen patterns are anchored on the identifiers a
   hypervisor actually publishes rather than a bare `xen` substring, which would have reported a
   board named Xenon as a guest. When nothing answers, the verdict is `unknown`, not a guess.
+- **`usb.usbguard_rule_scope`.** An allow-list that admits a whole interface class is the
+  deny-list failure mode wearing an allow-list's clothes: `allow with-interface { 08:*:* }`
+  accepts every mass-storage device ever made, and a BadUSB device picks the class it presents.
+  Allow rules carrying no device id, or wildcarding the vendor or product, are reported with the
+  offending lines. Rules as `usbguard generate-policy` emits them pass.
 - **`tests/usb-platform.sh`**, wired into the live CI job. A CI runner is a guest, so the case
   that matters most could never be exercised there; the test stubs `systemd-detect-virt` ahead on
   `PATH` and drives the real collector down the bare-metal branch, asserting that a missing USB
@@ -41,6 +46,20 @@ USB lockdown is now scored against the machine it is being audited on.
   attached later would be unrestricted.
 - **Where the platform cannot be determined, a missing control is `WARN`, never suppressed.**
   Deciding a machine is a guest on no evidence is how a real exposure gets buried.
+- **A driver deny-list was scored as equivalent to a device allow-list.** `usb.restriction_present`
+  reported `PASS` when the only control present was a `modprobe.d` blacklist of eight module
+  names. Those are not two ways of doing the same thing: a deny-list enumerates badness and is
+  only ever as complete as the list, so `usbserial`, `ftdi_sio`, `cdc_acm`, an audio or video
+  class, or any HID that is not `usbhid` all still bind, and a BadUSB device chooses which class
+  to present. Only default-deny controls (USBGuard with `block`/`reject` **and** rules,
+  `authorized_default=0`, `deny_new_usb`, `nousb`) now count toward a pass; a deny-list on its own
+  is reported as depth, not as the control. `reject` also now counts alongside `block`, and a
+  zero-rule policy no longer counts, both of which had drifted out of step with `usb.usbguard`.
+- **usbguard rule counts came from `wc -l`,** so comments and blank lines counted as rules. Worse,
+  `rules.conf` is `0600 root:root`, so a non-root run read nothing, called it zero and **failed
+  the host for an empty policy it had never read**. Rule lines are now counted properly, and an
+  unreadable rule file is `NA`, not a finding. The default-target verdict is decided first,
+  because it needs no rule count.
 - **usbguard with zero rules could report `PASS`.** `[ rules -gt 0 ] && [ target = block ] ||
   [ target = reject ]` parses as `(A && B) || C`, so `ImplicitPolicyTarget=reject` satisfied the
   condition on its own and a policy with no rules at all was advertised as correctly configured.

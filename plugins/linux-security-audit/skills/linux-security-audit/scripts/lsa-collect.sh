@@ -3876,21 +3876,59 @@ if have usbguard || [ -d "$(rf /etc/usbguard)" ]; then
        /etc/usbguard/usbguard-daemon.conf 2>/dev/null
   UGACTIVE=0
   have systemctl && systemctl is-active usbguard >/dev/null 2>&1 && UGACTIVE=1
-  RULES="$(wc -l < "$(rf /etc/usbguard/rules.conf)" 2>/dev/null | tr -d ' ')"
+  # rules.conf ships 0600 root:root. Counting its lines with wc also counted comments and blanks,
+  # and an unreadable file counted as zero, so a non-root run reported "0 rule(s)" and failed the
+  # host for an empty policy it had never actually read. Only real rule lines count, and a failed
+  # read is recorded as a failed read.
+  UGRF="$(rf /etc/usbguard/rules.conf)"
+  RULES=""; RULES_READ=0
+  if [ -r "$UGRF" ]; then
+    RULES_READ=1
+    RULES="$(grep -cE '^[[:space:]]*(allow|block|reject)' "$UGRF" 2>/dev/null | tr -d ' ')"
+  fi
   IPT="$(grep -hE '^\s*ImplicitPolicyTarget' "$(rf /etc/usbguard/usbguard-daemon.conf)" 2>/dev/null | awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')"
   if [ "$UGACTIVE" = "1" ]; then
     # Precedence matters here. Written as `A && B || C` the shell reads it as `(A && B) || C`,
     # so ImplicitPolicyTarget=reject used to satisfy the whole condition on its own and a policy
-    # with ZERO rules reported PASS. Both halves are now grouped explicitly.
-    if [ "${RULES:-0}" -gt 0 ] && { [ "$IPT" = "block" ] || [ "$IPT" = "reject" ]; }; then
-      chk usb.usbguard PASS "active, ${RULES:-0} rule(s), ImplicitPolicyTarget=$IPT" "unknown devices are denied by default"
-    elif [ "$IPT" = "block" ] || [ "$IPT" = "reject" ]; then
-      chk usb.usbguard FAIL "active, ImplicitPolicyTarget=$IPT, but ${RULES:-0} rule(s)" "the default is to deny, and nothing is explicitly allowed, so every device including the console keyboard is blocked. That is either a lockout waiting to happen or a policy that was never generated: run 'usbguard generate-policy' against the devices this host is meant to accept"
+    # with ZERO rules reported PASS. The default target is decided first because it needs no
+    # rule count, which keeps an unreadable rule file from masquerading as an empty one.
+    if [ "$IPT" != "block" ] && [ "$IPT" != "reject" ]; then
+      chk usb.usbguard FAIL "active but ImplicitPolicyTarget=${IPT:-allow}" "USBGuard is running in allow-by-default mode: it logs devices but blocks nothing. This is a deny-list posture, and the point of USBGuard is the opposite one. Set ImplicitPolicyTarget=block and generate an allow-list with 'usbguard generate-policy'"
+    elif [ "$RULES_READ" = "0" ]; then
+      chk usb.usbguard NA "active, ImplicitPolicyTarget=$IPT, rules.conf not readable" "the default is to deny, which is the right posture, but the allow-list could not be read (0600 root:root) so it is not known whether it is populated. Re-run as root to score it"
+    elif [ "${RULES:-0}" -gt 0 ]; then
+      chk usb.usbguard PASS "active, ${RULES:-0} rule(s), ImplicitPolicyTarget=$IPT" "a device that is not on the allow-list is refused, so an unknown one fails closed. See usb.usbguard_rule_scope for whether those rules name devices or admit whole classes"
     else
-      chk usb.usbguard FAIL "active but ImplicitPolicyTarget=${IPT:-allow} / ${RULES:-0} rule(s)" "USBGuard is running in allow-by-default mode: it logs devices but blocks nothing. Set ImplicitPolicyTarget=block and generate an allow-list with 'usbguard generate-policy'"
+      chk usb.usbguard FAIL "active, ImplicitPolicyTarget=$IPT, but 0 rule(s)" "the default is to deny and nothing is explicitly allowed, so every device including the console keyboard is blocked. That is either a lockout waiting to happen or a policy that was never generated: run 'usbguard generate-policy' against the devices this host is meant to accept"
     fi
   else
     chk usb.usbguard FAIL "installed but not active" "the daemon must be enabled and running for the policy to apply"
+  fi
+
+  # An allow-list that admits an entire interface class is barely an allow-list: "allow
+  # with-interface { 08:*:* }" accepts every mass-storage device ever made, which is the deny-list
+  # failure mode wearing an allow-list's clothes. Rules that carry no device id, or wildcard the
+  # vendor or product, are the ones to look at.
+  if [ "$RULES_READ" = "1" ]; then
+    UG_BROAD="$(awk '
+      /^[[:space:]]*allow/ {
+        broad = 0
+        if ($0 !~ /[[:space:]]id[[:space:]]/)                 broad = 1   # no device identity at all
+        if ($0 ~ /[[:space:]]id[[:space:]]+\*:\*/)            broad = 1   # any vendor, any product
+        if ($0 ~ /[[:space:]]id[[:space:]]+[0-9a-fA-F]+:\*/)  broad = 1   # an entire vendor
+        if (broad) printf "line %d: %s\n", NR, substr($0, 1, 90)
+      }' "$UGRF" 2>/dev/null)"
+    if [ -n "$UG_BROAD" ]; then
+      UG_BROAD_N="$(printf '%s\n' "$UG_BROAD" | grep -c .)"
+      chk usb.usbguard_rule_scope WARN "${UG_BROAD_N} allow rule(s) admit a class or wildcard rather than a device" \
+        "$(printf '%s' "$UG_BROAD" | tr '\n' ';') | any device presenting a matching interface class or vendor is accepted, so the policy stops being an inventory of permitted hardware. A BadUSB device picks the class it presents. Pin the rules to vendor:product with serial and hash where the device supports it, which is what 'usbguard generate-policy' emits by default"
+      raw "usbguard allow rules that are not device-specific"
+      printf '%s\n' "$UG_BROAD" | cap 10
+    else
+      chk usb.usbguard_rule_scope PASS "every allow rule names a specific device" "the allow-list is an inventory of permitted hardware rather than of permitted categories"
+    fi
+  else
+    chk usb.usbguard_rule_scope NA "rules.conf not readable" "cannot tell whether the allow-list names devices or admits whole classes; re-run as root"
   fi
   [ "$AM_ROOT" = "1" ] && have usbguard && { raw "usbguard device list"; run usbguard list-devices 2>/dev/null | cap 20; raw "usbguard rules"; run usbguard list-rules 2>/dev/null | cap 20; }
   raw "usbguard IPC access (who can change the policy)"
@@ -3935,7 +3973,7 @@ for m in usb_storage uas usbnet cdc_ether rndis_host cdc_ncm usbhid hid_generic;
      || printf '%s' "$MPD" | grep -qE "^\s*blacklist\s+$m\s*$"; then :; else USBMODS="$USBMODS $m"; fi
 done
 [ -n "$USBMODS" ] && chk usb.module_blacklist "$USB_ADV" "not blocked:$USBMODS" "usb_storage/uas enable mass-storage exfiltration; usbnet/cdc_ether/rndis let a USB device become a network interface and hijack routing/DNS; usbhid is the BadUSB keystroke-injection path (blocking it disables real keyboards, so headless hosts only). $USB_WHY" \
-                || chk usb.module_blacklist PASS "storage/network/HID USB modules blocked" ""
+                || chk usb.module_blacklist PASS "storage/network/HID USB modules blocked" "worth having, but it is a deny-list: only these drivers are refused and any other USB class still binds. usb.restriction_present is the check that says whether a default-deny policy exists"
 raw "USB-related modules currently loaded"
 lsmod 2>/dev/null | grep -E '^(usb_storage|uas|usbnet|cdc_ether|rndis_host|usbhid|firewire|thunderbolt)'
 
@@ -3949,14 +3987,28 @@ if [ -d /sys/bus/thunderbolt/devices ]; then
 fi
 
 # --- overall verdict: is ANY effective USB restriction in place? ---
-USBCTRL=""
-[ "$UGACTIVE" = "1" ] && [ "$IPT" = "block" ] && USBCTRL="$USBCTRL usbguard"
-[ "$(cat /proc/sys/kernel/deny_new_usb 2>/dev/null)" = "1" ] && USBCTRL="$USBCTRL deny_new_usb"
-[ "$AD_DENY" = "1" ] && USBCTRL="$USBCTRL authorized_default=0"
-case " $(cat /proc/cmdline 2>/dev/null) " in *" nousb "*) USBCTRL="$USBCTRL nousb" ;; esac
-[ -z "$USBMODS" ] && USBCTRL="$USBCTRL module-blacklist"
-if [ -n "$USBCTRL" ]; then
-  chk usb.restriction_present PASS "$USBCTRL" ""
+# Allow-listing and deny-listing are not two ways of doing the same thing, and this check used to
+# score them as if they were: blocking eight module names was enough to report PASS. A deny-list
+# enumerates badness, so it is only ever as complete as the list, and the attacker picks what is
+# not on it. An allow-list refuses anything that was not named in advance, so an unknown device
+# fails closed. Only default-deny controls count toward a pass here.
+USB_ALLOW=""
+# usbguard qualifies only when it is actually deny-by-default AND has rules, matching the verdict
+# in usb.usbguard. reject counts as well as block: both refuse an unlisted device.
+[ "$UGACTIVE" = "1" ] && [ "${RULES:-0}" -gt 0 ] && { [ "$IPT" = "block" ] || [ "$IPT" = "reject" ]; } \
+  && USB_ALLOW="$USB_ALLOW usbguard"
+[ "$(cat /proc/sys/kernel/deny_new_usb 2>/dev/null)" = "1" ] && USB_ALLOW="$USB_ALLOW deny_new_usb"
+[ "$AD_DENY" = "1" ] && USB_ALLOW="$USB_ALLOW authorized_default=0"
+case " $(cat /proc/cmdline 2>/dev/null) " in *" nousb "*) USB_ALLOW="$USB_ALLOW nousb" ;; esac
+# Deny-list controls: named drivers are refused, everything else still binds automatically.
+USB_DENY=""
+[ -z "$USBMODS" ] && USB_DENY=" module-blacklist"
+if [ -n "$USB_ALLOW" ]; then
+  chk usb.restriction_present PASS "default-deny:$USB_ALLOW${USB_DENY:+ (plus$USB_DENY)}" \
+    "an unlisted device is refused rather than driven"
+elif [ -n "$USB_DENY" ]; then
+  chk usb.restriction_present "$USB_ADV" "deny-list only:$USB_DENY, no default-deny policy" \
+    "the named modules are refused and every other USB driver still binds automatically: usbserial/ftdi_sio/cdc_acm for a serial console, audio or video class, or any HID that is not usbhid, and a BadUSB device chooses which class to present. A deny-list is worth keeping as depth, but it is not the control. Add USBGuard with ImplicitPolicyTarget=block and an allow-list from 'usbguard generate-policy', or set authorized_default=0 via udev, so that a device nobody listed is refused instead of enumerated"
 elif [ "$PLATFORM" = "physical" ]; then
   chk usb.restriction_present FAIL "none${CHASSIS:+ ($CHASSIS)}" "any USB device plugged into this machine is accepted and driven automatically: mass storage for exfiltration, a keyboard for BadUSB keystroke injection, or a network adapter that becomes the default route. Install USBGuard with ImplicitPolicyTarget=block, or set authorized_default=0 via udev"
 elif [ "$HAS_USB_HW" = "1" ]; then

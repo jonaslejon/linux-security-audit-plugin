@@ -105,6 +105,88 @@ Marvell Armada 8040 community board|physical
 DTCASES
 fi
 
+# An allow-list that admits a whole interface class is the deny-list failure mode wearing an
+# allow-list's clothes: "allow with-interface { 08:*:* }" accepts every mass-storage device ever
+# made. The awk program is lifted out of the collector rather than copied, so this cannot pass
+# while the collector matches something else.
+printf '\n== usbguard rule scope ==\n'
+SCOPE_AWK="$(sed -n '/UG_BROAD="\$(awk/,/}'"'"' "\$UGRF"/p' "$COLLECT" | sed '1d;$s/}.*/}/')"
+if [ -z "$SCOPE_AWK" ]; then
+  bad "could not extract the rule-scope matcher from the collector"
+else
+  RULES_TMP="$(mktemp)"
+  cat > "$RULES_TMP" <<'RULESEOF'
+# a policy as 'usbguard generate-policy' emits it
+allow id 1d6b:0002 serial "0000:00:14.0" name "xHCI Host Controller" hash "jEP=" with-interface 09:00:00
+allow id 046d:c52b serial "" name "USB Receiver" hash "kjh=" with-interface { 03:01:01 03:00:00 }
+allow with-interface equals { 08:*:* }
+allow id 046d:*
+allow id *:*
+allow
+block with-interface equals { 03:00:* }
+RULESEOF
+  broad="$(awk "$SCOPE_AWK" "$RULES_TMP" 2>/dev/null | grep -c . || true)"
+  if [ "$broad" = "4" ]; then
+    ok "4 broad allow rules flagged, the 2 device-specific ones and the block rule left alone"
+  else
+    bad "expected 4 broad allow rules to be flagged, got $broad"
+  fi
+  # Rule counting must ignore comments and blank lines, or a file of nothing but comments reads
+  # as a populated allow-list.
+  n="$(grep -cE '^[[:space:]]*(allow|block|reject)' "$RULES_TMP")"
+  if [ "$n" = "7" ]; then ok "rule count ignores comments and blanks: $n"
+  else bad "rule count was $n, want 7"; fi
+  rm -f "$RULES_TMP"
+fi
+
+# ---------------------------------------------------------------- allow-list beats deny-list
+# The summary check used to treat a driver deny-list as equivalent to a device allow-list, so
+# blocking eight module names reported PASS. A deny-list is only ever as complete as the list.
+# Needs docker: the collector short-circuits the whole section inside a container, so the case is
+# reached by making the container look like a host (PID 1 named init, no /.dockerenv).
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  printf '\n== a deny-list is not a default-deny policy ==\n'
+  W="$(mktemp -d)"
+  cat > "$W/drive.sh" <<'DRIVEEOF'
+set -u
+mkdir -p /stub /etc/modprobe.d /etc/usbguard
+printf '#!/bin/sh\necho none\nexit 1\n' > /stub/systemd-detect-virt; chmod +x /stub/systemd-detect-virt
+export PATH=/stub:$PATH
+case "$1" in
+  denylist)
+    for m in usb_storage uas usbnet cdc_ether rndis_host cdc_ncm usbhid hid_generic; do
+      printf 'blacklist %s\n' "$m" >> /etc/modprobe.d/usb.conf
+    done ;;
+  allowlist)
+    printf '#!/bin/sh\n[ "$1" = "is-active" ] && exit 0\nexit 1\n' > /stub/systemctl; chmod +x /stub/systemctl
+    printf 'ImplicitPolicyTarget=block\n' > /etc/usbguard/usbguard-daemon.conf
+    printf 'allow id 046d:c52b serial "" name "r" hash "h=" with-interface 03:01:01\nblock\n' \
+      > /etc/usbguard/rules.conf ;;
+esac
+bash /tmp/lsa.sh --quick --passive 2>/dev/null | grep '^CHECK|usb.restriction_present|' | cut -d'|' -f3,4
+DRIVEEOF
+  run_case() {
+    docker run --rm -v "$W/drive.sh:/tmp/drive.sh:ro" \
+      -v "$COLLECT:/tmp/lsa.sh:ro" -v /dev/null:/.dockerenv \
+      --entrypoint bash --network none debian:stable-slim \
+      -c "cp /bin/bash /usr/local/bin/init && exec init /tmp/drive.sh $1" 2>/dev/null
+  }
+  r="$(run_case denylist)"
+  case "$r" in
+    PASS*) bad "a module deny-list alone reported PASS: $r" ;;
+    WARN*|FAIL*) ok "deny-list only -> ${r%%|*} (not a pass)" ;;
+    *) bad "deny-list only produced no verdict: '$r'" ;;
+  esac
+  r="$(run_case allowlist)"
+  case "$r" in
+    PASS*) ok "usbguard allow-list with a deny-by-default target -> PASS" ;;
+    *) bad "a real default-deny allow-list did not pass: '$r'" ;;
+  esac
+  rm -rf "$W"
+else
+  printf '\n(skipping deny-list vs allow-list: docker not available)\n'
+fi
+
 # ---------------------------------------------------------------- live behaviour
 # The blocks above check the rule in isolation, which is only a statement of intent: they would
 # still pass if the collector stopped using that rule. These run the real collector and read its

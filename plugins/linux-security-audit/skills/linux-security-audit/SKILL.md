@@ -62,6 +62,15 @@ reason not to.
    rather than dropped, and that one is worth resolving by hand, because an unrecognised machine
    is often a physical one running a distribution without `systemd-detect-virt`.
 
+   When it is physical, recommend controls in the order that matches how they fail. **An
+   allow-list beats a deny-list**, so `usb.restriction_present` only passes on a default-deny
+   control: USBGuard with `ImplicitPolicyTarget=block` plus rules, `authorized_default=0`,
+   `deny_new_usb`, or `nousb`. A `modprobe.d` blacklist is worth keeping as depth but is not the
+   control, because it is only ever as complete as the list and a BadUSB device chooses which
+   class it presents. Do not report a blacklisted host as hardened, and do not stop at "USBGuard
+   is installed" either: check `usb.usbguard_rule_scope`, since an allow-list that admits an
+   entire interface class has the same weakness as the deny-list it replaced.
+
    It further distinguishes **two kinds of container**, reported in `container.context`:
 
    - **workload** — PID 1 is the application. This is a deployed container, so its seccomp profile,
