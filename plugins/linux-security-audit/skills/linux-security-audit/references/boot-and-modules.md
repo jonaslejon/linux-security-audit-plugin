@@ -5,13 +5,13 @@
 Verify with `cat /proc/cmdline`. Persist in `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`
 (then `update-grub` / `grub2-mkconfig -o …`), or `/etc/kernel/cmdline` on systemd-boot/UKI setups.
 
-### Memory and allocator hardening — low risk, apply broadly
+### Memory and allocator hardening: low risk, apply broadly
 
 | Parameter | Effect | Cost |
 |---|---|---|
 | `slab_nomerge` | Stops merging slab caches of similar size, which otherwise lets an attacker groom an unrelated object into a freed slot | Slightly more memory |
-| `init_on_alloc=1` | Zeroes newly allocated pages — kills uninitialised-memory info leaks | ~1–3% |
-| `init_on_free=1` | Zeroes freed pages — sharply reduces the value of use-after-free | ~2–5%, more on alloc-heavy loads |
+| `init_on_alloc=1` | Zeroes newly allocated pages: kills uninitialised-memory info leaks | ~1–3% |
+| `init_on_free=1` | Zeroes freed pages: sharply reduces the value of use-after-free | ~2–5%, more on alloc-heavy loads |
 | `page_alloc.shuffle=1` | Randomises the page allocator freelist | Negligible |
 | `randomize_kstack_offset=on` | Per-syscall randomisation of the kernel stack offset | ~1% |
 | `hardened_usercopy=1` | Keeps usercopy bounds checking on | Negligible |
@@ -25,13 +25,13 @@ Verify with `cat /proc/cmdline`. Persist in `GRUB_CMDLINE_LINUX_DEFAULT` in `/et
 | `debugfs=off` | Removes debugfs, which exposes broad kernel internals | Breaks some tracing/debug tooling |
 | `ia32_emulation=0` | Disables the entire 32-bit syscall ABI (kernel ≥6.7). Large, low-attention, historically buggy surface | Breaks all 32-bit binaries |
 | `nousb` | No USB at all | Physical machines only |
-| `ipv6.disable=1` | IPv6 stack not loaded at all | **POLICY** — verify nothing needs IPv6 first, and remove IPv6 sysctls from `/etc/sysctl.d/` or boot will log failures |
+| `ipv6.disable=1` | IPv6 stack not loaded at all | **POLICY**; verify nothing needs IPv6 first, and remove IPv6 sysctls from `/etc/sysctl.d/` or boot will log failures |
 | `random.trust_cpu=off` / `random.trust_bootloader=off` | Do not seed the RNG from RDRAND/bootloader alone | Slower boot-time entropy availability; can stall early boot on entropy-poor VMs |
 | `efi=disable_early_pci_dma` | Blocks pre-boot DMA from PCI devices | UEFI only |
 | `intel_iommu=on` / `amd_iommu=on`, `iommu.passthrough=0`, `iommu.strict=1` | DMA protection from Thunderbolt/PCIe peripherals | Small I/O cost |
 | `proc_mem.force_override=never` | Blocks `/proc/<pid>/mem` writes | Breaks some debuggers |
 
-### One-way / high-impact — read the cost column carefully
+### One-way / high-impact; read the cost column carefully
 
 | Parameter | Effect | Cost |
 |---|---|---|
@@ -43,7 +43,7 @@ Verify with `cat /proc/cmdline`. Persist in `GRUB_CMDLINE_LINUX_DEFAULT` in `/et
 | `quiet loglevel=0` | Suppresses boot console output | Makes boot troubleshooting harder |
 | `hash_pointers=always` | Forces pointer hashing in kernel output (≥6.17) | Debug output less useful |
 
-### CPU vulnerability mitigations — POLICY, measure before applying
+### CPU vulnerability mitigations: POLICY, measure before applying
 
 `mitigations=auto,nosmt` is the KSPP recommendation and enables the defaults *plus* disables SMT
 where a vulnerability needs it. The explicit form:
@@ -59,7 +59,7 @@ unreachable and the cost is not obviously worth it; on a shared/multi-tenant hos
 running untrusted code (CI runners, container platforms, browsers, sandboxed scanners) it is.
 State which case the host is in rather than recommending blindly.
 
-Always cross-check the actual outcome against `/sys/devices/system/cpu/vulnerabilities/*` — those
+Always cross-check the actual outcome against `/sys/devices/system/cpu/vulnerabilities/*`: those
 files report what the kernel *achieved*, including microcode-dependent parts, which the command
 line alone does not tell you. `mitigations=off` anywhere is a serious finding.
 
@@ -78,7 +78,7 @@ or kernel image), so report them together.
 
 ## Module blacklisting
 
-`/etc/modprobe.d/*.conf`. Use `install <module> /bin/false` — `blacklist <module>` only prevents
+`/etc/modprobe.d/*.conf`. Use `install <module> /bin/false`: `blacklist <module>` only prevents
 *automatic* loading, and an explicit `modprobe` still works. Reserve `/bin/true` for modules whose
 absence should not produce an error (network filesystems that something might optionally probe).
 
@@ -87,7 +87,7 @@ still load.
 
 ### Obscure network protocols
 
-Auto-loaded when a socket of that family is created — so an unprivileged local program can load any
+Auto-loaded when a socket of that family is created, so an unprivileged local program can load any
 of them on demand. Repeatedly a source of privesc CVEs.
 
 ```
@@ -117,7 +117,7 @@ automotive/embedded.
 
 ### Rare filesystems
 
-Auto-loaded on mount attempt — including from an attacker-supplied image or a removable device.
+Auto-loaded on mount attempt, including from an attacker-supplied image or a removable device.
 These drivers are largely unmaintained and fuzz badly.
 
 ```
@@ -130,11 +130,11 @@ install squashfs /bin/false
 install udf /bin/false
 ```
 
-**`squashfs` breaks Snap** (all snaps are squashfs images) — on Ubuntu this disables everything
+**`squashfs` breaks Snap** (all snaps are squashfs images): on Ubuntu this disables everything
 installed via snap, including `lxd` and often the `core` runtime. Check before applying.
 `udf` breaks optical media. `cramfs` is used by some initramfs setups.
 
-### Network filesystems (`/bin/true` — absent, not an error)
+### Network filesystems (`/bin/true`: absent, not an error)
 
 ```
 install cifs /bin/true
@@ -160,7 +160,7 @@ install thunderbolt /bin/false    # DMA-capable
 install usb-storage /bin/false    # blocks USB mass storage (physical hosts)
 ```
 
-Servers should have Bluetooth, webcam, FireWire and Thunderbolt blocked as a matter of course —
+Servers should have Bluetooth, webcam, FireWire and Thunderbolt blocked as a matter of course:
 zero cost, since nothing uses them. On laptops these are real functionality; ask.
 
 ### Checking what is actually loaded
@@ -168,7 +168,7 @@ zero cost, since nothing uses them. On laptops these are real functionality; ask
 ```bash
 lsmod
 # a module in the blacklist that is currently loaded means the blacklist was added
-# after boot, or it is pulled in from the initramfs — both need a reboot to take effect
+# after boot, or it is pulled in from the initramfs: both need a reboot to take effect
 ```
 
 ---
@@ -176,8 +176,8 @@ lsmod
 ## `kernel.modules_disabled=1`
 
 The strongest single anti-rootkit setting: after it is set, no module can be loaded or unloaded for
-the rest of the uptime. LKM rootkits — REPTILE, Diamorphine, and the tooling Mandiant attributed to
-UNC3886 — all depend on module loading.
+the rest of the uptime. LKM rootkits: REPTILE, Diamorphine, and the tooling Mandiant attributed to
+UNC3886: all depend on module loading.
 
 It is **one-way**. Once set: no new hardware requiring a driver, no DKMS build, no `modprobe`, no
 `wg`/`nf_tables`/filesystem module loading on demand. Apply it late in boot, after everything else

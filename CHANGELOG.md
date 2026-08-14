@@ -9,7 +9,7 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
-## [1.7.0] — 2026-08-14
+## [1.7.0]: 2026-08-14
 
 USB lockdown is now scored against the machine it is being audited on.
 
@@ -67,7 +67,22 @@ USB lockdown is now scored against the machine it is being audited on.
   with that explanation.
 - The offline (`--root`) skip for this section claimed the run was "inside a container".
 
-## [1.6.0] — 2026-08-13
+### Changed
+
+- **Em-dashes removed from every check note, document and comment** (792 of them). They are read
+  on serial consoles and in terminals where the encoding is not guaranteed, and a finding whose
+  explanation renders as mojibake is a finding nobody acts on. Each was replaced by the
+  punctuation the sentence actually wanted rather than a blanket comma: a colon where a label
+  introduces its explanation, a semicolon before an instruction, a comma before a conjunction or
+  a relative clause, and paired dashes converted as a unit (to commas, or to parentheses where
+  the aside already contained commas) so a bracketing pair could not be split into two unrelated
+  marks. Verified by collecting from the same image before and after: all 200 check IDs and
+  verdicts byte-identical, so only prose changed.
+- **Removed `out.txt`**, a 74 KB collector run from a scratch container committed by accident in
+  1.5.2, and added the collector's output filenames to `.gitignore` so a working file cannot be
+  committed as source again.
+
+## [1.6.0]: 2026-08-13
 
 Changes to the skill layer, driven by what auditing six real images actually required.
 
@@ -109,7 +124,7 @@ Changes to the skill layer, driven by what auditing six real images actually req
   The claim that this is not a compliance tool stays inline, since it constrains how every report
   is written. The method-model explanation is condensed to the part that changes behaviour.
 
-## [1.5.3] — 2026-08-13
+## [1.5.3]: 2026-08-13
 
 Found by auditing the official `debian:latest` and `ubuntu:latest` images.
 
@@ -127,7 +142,7 @@ Found by auditing the official `debian:latest` and `ubuntu:latest` images.
   CI asserts both directions on real images: stock Ubuntu must pass, and a home `chgrp`'d to a
   group with two members must still be reported.
 
-## [1.5.2] — 2026-08-13
+## [1.5.2]: 2026-08-13
 
 The two UBI findings that were flagged as suspect rather than reported. One was a symptom of a
 defect affecting every command the collector runs under a timeout.
@@ -150,7 +165,7 @@ defect affecting every command the collector runs under a timeout.
   nginx nor httpd and still got "worker user not determined". Now `NA` when no web server binary,
   configuration directory or document root exists; unchanged when one does.
 
-## [1.5.1] — 2026-08-13
+## [1.5.1]: 2026-08-13
 
 Six issues found by auditing the official Red Hat UBI 9 image, the first RPM-based target. All
 six are cross-distro; none were reachable from the Debian images tested before.
@@ -176,7 +191,7 @@ six are cross-distro; none were reachable from the Debian images tested before.
   kernel audit subsystem is not namespaced, container logs go to the runtime's log driver, and the
   kernel is the host's. UBI reported four failures for controls it cannot implement.
 
-## [1.5.0] — 2026-08-13
+## [1.5.0]: 2026-08-13
 
 Container reports were mostly noise. Auditing three production images produced 55 non-`PASS` lines
 each, of which 49 were host controls a container cannot implement and 3 were actionable.
@@ -214,7 +229,7 @@ each, of which 49 were host controls a container cannot implement and 3 were act
 - **`integrity.pkgverify_missing` is `INFO` in a container**, where missing packaged files are
   deliberate slimming rather than drift.
 
-## [1.4.1] — 2026-08-13
+## [1.4.1]: 2026-08-13
 
 Three false positives found by running the collector against real Docker images.
 
@@ -238,7 +253,7 @@ Three false positives found by running the collector against real Docker images.
   immutable and the container is replaced on the next deploy, so in-place patching is the wrong
   control: it belongs to the rebuild pipeline. Now `NA` in a container context with that reasoning.
 
-## [1.4.0] — 2026-08-13
+## [1.4.0]: 2026-08-13
 
 Offline mode did not work. `--root` was wired into two sections and nowhere else, so 270 of the
 277 filesystem path operands read the machine running the audit instead of the mounted image.
@@ -365,12 +380,12 @@ Everything here was reported by Patrik Solsten, who cloned the repo and actually
 - Report template gained collector version/SHA, elapsed time and truncation rows, and now states
   that a high `undetermined_pct` under `--root` is the expected shape of an offline audit.
 
-## [1.3.0] — 2026-08-12
+## [1.3.0]: 2026-08-12
 
 ### Added
 
 - **Dependency-free `/proc` backend for `lsa-trace.sh --live`.** Every tracing backend
-  previously required `bpftrace`, `opensnoop`, `fatrace` or `strace` — which is precisely what
+  previously required `bpftrace`, `opensnoop`, `fatrace` or `strace`, which is precisely what
   a hardened image strips, and which this project's own `packages.prohibited` check reports as
   a finding when present. Requiring one in order to run the tracer was self-defeating, and
   installing one is a persistent change to the audited host.
@@ -395,16 +410,16 @@ Everything here was reported by Patrik Solsten, who cloned the repo and actually
 ### Fixed
 
 - `v1.1.2` was tagged without a changelog entry, and its three false-positive fixes were
-  written up under `1.2.0` — attributing them to a release they did not ship in. Each version
+  written up under `1.2.0`, attributing them to a release they did not ship in. Each version
   now has a matching entry.
 
-## [1.2.0] — 2026-08-12
+## [1.2.0]: 2026-08-12
 
 ### Added
 
 - **eBPF section.** eBPF executes attacker-reachable code in the kernel *without loading a
-  module*, so `kernel.modules_disabled=1` — the strongest anti-LKM-rootkit control this audit
-  recommends — does not constrain it at all. Published eBPF rootkits (TripleCross, ebpfkit,
+  module*, so `kernel.modules_disabled=1`: the strongest anti-LKM-rootkit control this audit
+  recommends: does not constrain it at all. Published eBPF rootkits (TripleCross, ebpfkit,
   boopkit) hook syscalls, hide processes and files, and implement backdoor triggers this way.
   Coverage: `unprivileged_bpf_disabled` semantics (0/1/2), JIT hardening, loaded programs by
   type with the syscall/packet/LSM-hooking types called out, programs with no owning process,
@@ -412,11 +427,11 @@ Everything here was reported by Patrik Solsten, who cloned the repo and actually
   process and no file on disk), XDP attachments (which see and can rewrite packets before the
   network stack, including before tcpdump), tc BPF filters, `CAP_BPF`/`CAP_PERFMON` holders,
   and the kernel-lockdown interaction that actually constrains all of it.
-  Loaded programs are not treated as inherently suspicious — Cilium, Calico, Falco, Datadog
-  and systemd all load them legitimately — so the section enumerates and attributes rather
+  Loaded programs are not treated as inherently suspicious: Cilium, Calico, Falco, Datadog
+  and systemd all load them legitimately, so the section enumerates and attributes rather
   than alarms.
 
-## [1.1.2] — 2026-08-12
+## [1.1.2]: 2026-08-12
 
 ### Fixed
 
@@ -429,21 +444,21 @@ findings that did not exist:
   symlinks) and `bootchain.unit_inputs`. `path_risk` now dereferences and judges the target,
   dangling links are skipped, and the writability scans no longer match symlinks at all.
 - **Non-TLS ports probed as TLS endpoints.** OpenSSL prints `Cipher : 0000` when no handshake
-  occurred, which the endpoint test accepted as a valid cipher — so SSH on 22 and plaintext
+  occurred, which the endpoint test accepted as a valid cipher, so SSH on 22 and plaintext
   HTTP on 80 were treated as TLS and given a full battery of bogus weak-cipher `FAIL`s. A named
   cipher is now required.
 - **Weak-cipher probes bounded by the local openssl.** Families the local build cannot offer
   were reported `ACCEPTED`, recording the client's inability to ask as the server's answer.
   Each family is now pre-checked with `openssl ciphers` and reported `NA` when untestable, and
-  a completed handshake must negotiate a cipher *inside* the tested family before it counts —
+  a completed handshake must negotiate a cipher *inside* the tested family before it counts,
   which also catches `-cipher` failing to constrain and the server picking something modern.
 
-## [1.1.1] — 2026-08-12
+## [1.1.1]: 2026-08-12
 
 ### Fixed
 
-- **`PATH` missing the sbin directories.** A non-login shell — which is what
-  `ssh host 'sudo bash -s' < script` produces, the invocation this project documents — usually
+- **`PATH` missing the sbin directories.** A non-login shell, which is what
+  `ssh host 'sudo bash -s' < script` produces, the invocation this project documents, usually
   has no `/sbin` or `/usr/sbin`. `have()` therefore returned false for `iptables`, `nft`, `ss`,
   `sshd`, `auditctl`, `lsmod`, `sysctl` and `findmnt`, and every dependent check reported the
   control as **absent on hosts where it was installed and running**. Reported in the field as
@@ -458,13 +473,13 @@ findings that did not exist:
 
 ### Added
 
-- `collect.missing_tools` — reports absent collection tools once and explicitly, so a missing
+- `collect.missing_tools`: reports absent collection tools once and explicitly, so a missing
   binary can no longer masquerade as a missing control.
 - **Refuses to run on a non-Linux kernel.** Previously it would emit a full report on, say,
-  macOS, where nearly every check degrades to absent — output that reads like findings and is
+  macOS, where nearly every check degrades to absent: output that reads like findings and is
   really just "wrong operating system". `--force` overrides, for development only.
 
-## [1.1.0] — 2026-08-12
+## [1.1.0]: 2026-08-12
 
 ### Added
 
@@ -488,7 +503,7 @@ Build-time supply chain is deliberately **not** implemented: image CVE scanning,
 generation, signature verification and admission control belong to a different lifecycle stage
 and to purpose-built tools. Their presence is reported rather than reimplemented.
 
-## [1.0.0] — 2026-08-12
+## [1.0.0]: 2026-08-12
 
 Initial release. 249 checks across 31 areas.
 
@@ -498,7 +513,7 @@ Initial release. 249 checks across 31 areas.
   context detected automatically. Host-owned checks report `NA` inside a container rather than
   describing the host and calling it the container.
 - Every check is tagged `static` (files on disk), `runtime` (live kernel and process state) or
-  `active` (probes a running service). *Not active* does not mean *works offline* — roughly two
+  `active` (probes a running service). *Not active* does not mean *works offline*: roughly two
   thirds of checks need a booted system, and the tag makes that visible.
 - `--passive` disables all active checks; `--quick` skips whole-filesystem walks;
   `--apt-update` is opt-in and is the only thing that writes anything.

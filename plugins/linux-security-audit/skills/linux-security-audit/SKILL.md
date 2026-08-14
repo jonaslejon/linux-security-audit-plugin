@@ -12,12 +12,12 @@ explicitly approved step**.
 ## What this does to the system
 
 Designed to be run against production, so here is the precise inventory rather than a blanket
-warning — an overstated caution just gets ignored.
+warning: an overstated caution just gets ignored.
 
 **`scripts/lsa-collect.sh` writes nothing by default.** No config is modified, no service is
 started, stopped or reloaded, no package is installed. Two side effects worth knowing:
 
-- **Active checks open loopback connections** — a TLS ClientHello to each listening port and an
+- **Active checks open loopback connections**: a TLS ClientHello to each listening port and an
   HTTP HEAD to `127.0.0.1`, plus NTP peer queries. Harmless, but they appear in the audited
   service's *own logs* as connections from localhost. `--passive` removes them entirely.
 - **`--apt-update` is opt-in and off by default.** It is the only thing that writes anything
@@ -41,7 +41,7 @@ reason not to.
 ## Rules of engagement
 
 1. **Read-only by default.** `scripts/lsa-collect.sh` changes nothing. Never apply hardening as
-   part of an audit — collect, analyse, report, then ask.
+   part of an audit; collect, analyse, report, then ask.
 2. **Confirm the target before touching it.** Name the host(s) and get a go-ahead before SSH-ing
    into anything the user did not explicitly point you at. Production hosts especially.
 3. **No exploitation.** This is a configuration audit. Do not attempt privilege escalation,
@@ -73,9 +73,9 @@ reason not to.
 
    It further distinguishes **two kinds of container**, reported in `container.context`:
 
-   - **workload** — PID 1 is the application. This is a deployed container, so its seccomp profile,
+   - **workload**: PID 1 is the application. This is a deployed container, so its seccomp profile,
      `no_new_privs`, rootfs mode and namespaced sysctls are real findings about the deployment.
-   - **inspection** — PID 1 is a shell, so the container exists only to read an image (`docker run
+   - **inspection**: PID 1 is a shell, so the container exists only to read an image (`docker run
      -i <image> bash -s < collector`). Runtime posture here belongs to *your* `docker run`, not to
      the image, so it reports `NA`. What survives is genuinely image-level: `USER`, SUID binaries,
      baked `ENV` secrets, repo trust, package surface.
@@ -105,7 +105,7 @@ practitioner hardening practice.
 
 ### 2. Collect
 
-Run the collector. It is one self-contained bash script — prefer it over dozens of ad-hoc
+Run the collector. It is one self-contained bash script; prefer it over dozens of ad-hoc
 commands, both for speed and so nothing is silently skipped.
 
 Locate the collector rather than assuming a path: it moves depending on whether the skill was
@@ -115,7 +115,7 @@ installed as a plugin, cloned as a marketplace, or dropped into `~/.claude/skill
 # -L follows symlinks: a skill installed by symlinking into ~/.claude/skills is invisible without it
 SK="$(find -L "${CLAUDE_PLUGIN_ROOT:-$HOME/.claude}" "$HOME/.claude/plugins" "$HOME/.claude/skills" \
         -name lsa-collect.sh -path '*linux-security-audit*' 2>/dev/null | head -1)"
-[ -n "$SK" ] || echo 'collector not found — check the plugin is installed'
+[ -n "$SK" ] || echo 'collector not found; check the plugin is installed'
 
 OUT=/tmp/lsa-<host>-$(date +%Y%m%d).txt      # or any working directory
 ```
@@ -126,7 +126,7 @@ sudo bash "$SK" > "$OUT"
 
 # remote (preferred: pipe the script in, leave nothing behind on the target)
 ssh -p <port> <user>@<host> 'sudo bash -s -- ' < "$SK" > "$OUT"
-# without sudo (many checks degrade to NA — say so in the report)
+# without sudo (many checks degrade to NA: say so in the report)
 ssh -p <port> <user>@<host> 'bash -s' < "$SK" > "$OUT"
 
 # container image. --entrypoint is required: without it, `bash` is passed as an ARGUMENT to the
@@ -144,7 +144,7 @@ the container you just started, not the image, so they report `NA`. Use `docker 
 real workload when you need those.
 
 ```bash
-# golden image / ISO / unbooted system — mount it and point --root at the mountpoint
+# golden image / ISO / unbooted system; mount it and point --root at the mountpoint
 mount -o loop,ro image.raw /mnt
 sudo bash "$SK" --root /mnt > "$OUT"
 ```
@@ -164,14 +164,14 @@ file on the target instead of stdout. `--apt-update` opts in to refreshing the A
 
 The collector uses both, and tags every `CHECK` line with which produced it:
 
-- **`static`** — reads files on disk only. These are the checks that work under `--root` against a
+- **`static`**: reads files on disk only. These are the checks that work under `--root` against a
   mounted image: sudoers, secrets, module blacklists, log retention, cron, SSH config, package and
   repo trust.
-- **`runtime`** — reads live kernel and process state: `/proc/sys` sysctls, `/proc/cmdline`,
+- **`runtime`**: reads live kernel and process state: `/proc/sys` sysctls, `/proc/cmdline`,
   `lsmod`, `ps`, `ss`, `systemctl is-active`, `/proc/<pid>/fd`, or queries an installed binary
   (`nginx -V`). Safe on production and it touches no service, **but it is meaningless on an offline
-  image** — under `--root` these report `NA`, they do not pass.
-- **`active`** — interacts with a service or the network: local TLS handshakes, an HTTP request to
+  image**: under `--root` these report `NA`, they do not pass.
+- **`active`**: interacts with a service or the network: local TLS handshakes, an HTTP request to
   loopback, `apt-get update`, NTP source queries, `sudo -l`. Suppressed by `--passive`.
 
 The run's actual distribution is printed in the output header (`method_counts=`) along with total
@@ -187,23 +187,23 @@ before trusting any other `PASS`; and TLS cipher/protocol negotiation and genuin
 rather than passing. Both are covered in `references/checklist.md` and `references/tls-and-mtls.md`.
 
 Always save raw output to a working directory and cite line numbers from it as evidence. Multiple
-hosts: collect them all first, then compare — drift between supposedly-identical hosts is itself
+hosts: collect them all first, then compare: drift between supposedly-identical hosts is itself
 a finding.
 
 ### 3. Analyse
 
 The output has two kinds of content:
 
-- `CHECK|<id>|<PASS|FAIL|WARN|INFO|NA>|<observed>|<note>|<static|runtime|active>` — deterministic
+- `CHECK|<id>|<PASS|FAIL|WARN|INFO|NA>|<observed>|<note>|<static|runtime|active>`: deterministic
   checks. Grep these first: `grep '^CHECK|' $OUT | grep -v '|PASS|'`. Every record has exactly six
   fields: a `|` occurring inside a value is emitted as `%7C` so `awk -F'|'` stays correct. Linux
   `core_pattern` is the common case, since a leading `|` there means "pipe to this handler".
-- `===== SECTION X =====` blocks of raw evidence — these need judgement (firewall rules, SUID
+- `===== SECTION X =====` blocks of raw evidence: these need judgement (firewall rules, SUID
   list, running services, cron contents, sudoers). Read them; do not just count `FAIL` lines.
 
 Statuses: `FAIL` = control absent or wrong. `WARN` = weaker than recommended or needs a human
 call. `INFO` = reported for judgement, no verdict. `NA` = not applicable on this kernel/distro, or
-not determinable at the privilege level used — **never report `NA` as compliant**.
+not determinable at the privilege level used, **never report `NA` as compliant**.
 
 `POLICY` in a note means the control has a real cost and the right answer depends on the host's
 job. Do not report these as flat failures; report them as a decision with the trade-off stated.
@@ -213,7 +213,7 @@ routers/NAT gateways/container hosts), `accept_ra=0` (breaks SLAAC-configured ho
 `oops=panic`, `module.sig_enforce=1` (breaks DKMS/out-of-tree drivers), `lockdown=confidentiality`.
 
 Consult the reference files for anything you are not certain about rather than guessing at what a
-value means — several of these settings mean different things on different distros and kernel
+value means: several of these settings mean different things on different distros and kernel
 versions (see `references/sysctl.md` → *Distro and version traps*).
 
 ### Verifying a finding
@@ -238,15 +238,15 @@ misfiring for everyone.
 
 Findings from a container fall into three groups, and saying which is most of the value:
 
-- **Image** — fixed in the `Dockerfile` and shipped by a rebuild: `container.runs_as_root` (add a
+- **Image**: fixed in the `Dockerfile` and shipped by a rebuild: `container.runs_as_root` (add a
   `USER`), `container.suid_binaries`, `container.env_secrets`, `repo.*`, `packages.*`,
   `system.base_os*`, `perm.*`, `secrets.*`.
-- **Deployment** — fixed in the compose file, swarm service or pod spec, and *not* defects in the
+- **Deployment**: fixed in the compose file, swarm service or pod spec, and *not* defects in the
   image: `container.no_new_privs`, `container.readonly_rootfs`, `container.mac`,
   `container.privileged`, `container.seccomp`, and every namespaced `sysctl.*`. When the collector
   ran in inspection mode these are `NA`, because they described the container you started to read
   the image with.
-- **Host or orchestrator** — reported `NA` with the reason: mount layout, firewall, time sync,
+- **Host or orchestrator**: reported `NA` with the reason: mount layout, firewall, time sync,
   auditd, remote logging, kernel currency, and the interactive-login family.
 
 Say plainly which group each finding is in. "Your image runs as root" and "your deployment does not
@@ -258,7 +258,7 @@ Then look for what the collector cannot judge alone:
   "active" but has an `ACCEPT` default policy; `auditd` running with zero rules; AIDE installed
   with a database older than the last package update.
 - Reconcile the listening-socket list against the firewall. Every `exposed.<port>` FAIL is only a
-  real finding once you check whether a firewall or provider security group covers it — and every
+  real finding once you check whether a firewall or provider security group covers it, and every
   port the firewall *does* leave open should appear in the listener list. A service that could bind
   `127.0.0.1` instead is a better fix than a firewall rule.
 - For web servers, the highest-yield questions are not header flags: is the document root writable
@@ -268,15 +268,15 @@ Then look for what the collector cannot judge alone:
 - For TLS, separate *encrypted* from *authenticated*. An internal listener with no client-certificate
   requirement, `--tls` without `--tlsverify`, rsyslog `StreamDriverAuthMode` other than `x509/name`,
   `proxy_ssl_verify` left at its off default, or a `curl -k` in a cron job are all "TLS is on" and
-  "nobody is authenticated" at the same time. `tls.*.mtls|WARN` — requested but not enforced — is
+  "nobody is authenticated" at the same time. `tls.*.mtls|WARN`, requested but not enforced, is
   the one people misread as compliant.
 - For root processes, the finding is not the count. It is the specific process that is both root
   and reachable (`proc.root_listeners`), or the application daemon with no reason to be root
-  (`proc.root_unexpected`). Name them individually with the least-privilege fix — `User=` or
+  (`proc.root_unexpected`). Name them individually with the least-privilege fix: `User=` or
   `DynamicUser=yes` in a unit drop-in, `CAP_NET_BIND_SERVICE` or socket activation instead of root
   for a low port.
 - For logging, read retention and readability together. `logret.*` gives three independent limits
-  (journald, logrotate, auditd) and the **shortest one wins** — quote the computed number of days,
+  (journald, logrotate, auditd) and the **shortest one wins**; quote the computed number of days,
   not the config. `logperm.logrotate_create|FAIL` explains why a previously "fixed" permission is
   wrong again: the mode reverts at every rotation. And members of `adm`/`systemd-journal` read every
   log without `sudo`, so they leave no sudo trail doing it.
@@ -286,7 +286,7 @@ Then look for what the collector cannot judge alone:
   the system still reports Enforcing, and for AppArmor's unprofiled processes.
 - Attack paths, not just missing settings. A world-writable script in `/etc/cron.d`, an unusual
   SUID binary, a `NOPASSWD` sudo rule, or docker-group membership each convert local access to
-  root — say so explicitly and rank accordingly.
+  root: say so explicitly and rank accordingly.
 - Anything that looks like existing compromise (non-empty `/etc/ld.so.preload`, unexplained SUID
   binaries in `/tmp` or `/var`, unknown UID-0 accounts, recently modified system binaries) goes to
   the top of the report and gets flagged as *investigate now*, not *harden later*.
@@ -295,40 +295,40 @@ Then look for what the collector cannot judge alone:
 
 Use `assets/report-template.md`. Rank by exploitability on this host, not by checklist order.
 Every finding needs: what was observed (with evidence), why it matters here, the exact fix, and
-what the fix might break. Include a short "already in good shape" list — it tells the user what
+what the fix might break. Include a short "already in good shape" list: it tells the user what
 not to re-do, and it makes the report honest.
 
-### 5. Remediate — only when asked
+### 5. Remediate, only when asked
 
 Get explicit approval, then work from `references/remediation.md`. Apply in the order given
 there (lowest lockout risk first), keep every change in a drop-in file under `/etc/*.d/` rather
 than editing distro-managed files, back up anything you overwrite, and re-run the collector
 afterwards to prove the delta. For anything that only takes effect at boot (cmdline, fstab,
-modprobe, GRUB password), state clearly that it is unverified until a reboot — and that a reboot
+modprobe, GRUB password), state clearly that it is unverified until a reboot, and that a reboot
 is the risky moment.
 
 ## Reference files
 
 Load these on demand, not upfront:
 
-- `references/checklist.md` — the full check catalogue: what each control does, how to verify it
+- `references/checklist.md`: the full check catalogue: what each control does, how to verify it
   by hand, expected value, and its caveats. The authority for interpreting collector output.
-- `references/sysctl.md` — every sysctl, what it defends against, and the distro/version traps.
-- `references/boot-and-modules.md` — kernel cmdline parameters, module blacklisting, lockdown,
+- `references/sysctl.md`: every sysctl, what it defends against, and the distro/version traps.
+- `references/boot-and-modules.md`: kernel cmdline parameters, module blacklisting, lockdown,
   Secure Boot, CPU mitigations.
-- `references/webserver-and-ports.md` — listening-port exposure and the ports that must never be
+- `references/webserver-and-ports.md`: listening-port exposure and the ports that must never be
   public; NTP/NTS security both as client and as a potential reflector; nginx, Apache, PHP, TLS
   certificate and webroot hardening.
-- `references/tls-and-mtls.md` — cipher and protocol policy, why it needs active testing, and the
+- `references/tls-and-mtls.md`: cipher and protocol policy, why it needs active testing, and the
   per-service table of *which setting actually enforces peer verification* for mutual TLS.
-- `references/services-ssh-logging.md` — SSH server/client hardening, systemd unit sandboxing,
+- `references/services-ssh-logging.md`: SSH server/client hardening, systemd unit sandboxing,
   remote logging, auditd, file-integrity monitoring.
-- `references/remediation.md` — ready-to-apply config templates and the safe order to apply them.
-- `scripts/lsa-trace.sh` — runtime tracing of what root actually opens: `--live <secs>` (passive,
+- `references/remediation.md`: ready-to-apply config templates and the safe order to apply them.
+- `scripts/lsa-trace.sh`: runtime tracing of what root actually opens: `--live <secs>` (passive,
   bpftrace/opensnoop/fatrace), `--unit <name>` (restarts one service), `--boot arm`/`--boot report`
-  (temporary auditd rules across a reboot). Not run automatically — the last two are disruptive.
-- `assets/report-template.md` — report structure.
-- `references/tooling-and-scope.md` — what else to run alongside (Lynis, OpenSCAP, `testssl.sh`,
+  (temporary auditd rules across a reboot). Not run automatically: the last two are disruptive.
+- `assets/report-template.md`: report structure.
+- `references/tooling-and-scope.md`: what else to run alongside (Lynis, OpenSCAP, `testssl.sh`,
   `kernel-hardening-checker`), the relationship to CIS and STIG, how this differs from Lynis and
   linPEAS, and the known coverage gaps to name in a report's *Not assessed* section.
 
@@ -343,6 +343,6 @@ when the deliverable is an audit artifact. Details, and the comparison to other 
 Home, updates and issues: <https://github.com/jonaslejon/linux-security-audit-plugin>
 
 Installed with `/plugin marketplace add jonaslejon/linux-security-audit-plugin` then
-`/plugin install linux-security-audit`. If a check misfires — especially a `FAIL` that should
-have been `NA` — that is worth reporting there, because a manufactured finding is the failure
+`/plugin install linux-security-audit`. If a check misfires, especially a `FAIL` that should
+have been `NA`: that is worth reporting there, because a manufactured finding is the failure
 mode this skill cares most about avoiding.

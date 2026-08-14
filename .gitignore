@@ -1,2 +1,8 @@
 .DS_Store
 *.swp
+out.txt
+*.collection.txt
+live.txt
+live.err
+ctr.txt
+ubu.txt

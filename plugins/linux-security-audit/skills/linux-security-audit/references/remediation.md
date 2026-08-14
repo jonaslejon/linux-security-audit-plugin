@@ -11,18 +11,18 @@ Only after explicit approval. Auditing and changing are separate steps.
 2. **Back up anything you overwrite**, with a timestamp: `cp -a f f.bak.$(date +%F-%H%M)`.
 3. **One change class at a time, then verify.** Batching a firewall change with an SSH change means
    you cannot tell which one locked you out.
-4. **Anything that only takes effect at boot is unverified until reboot** — and the reboot is the
+4. **Anything that only takes effect at boot is unverified until reboot**, and the reboot is the
    risky moment. Schedule it, have console/KVM access ready, and know the recovery path.
 5. **Re-run the collector afterwards** and show the before/after delta as evidence.
 
-## Order of application — lowest risk first
+## Order of application: lowest risk first
 
 | Phase | Changes | Risk |
 |---|---|---|
-| 1 | sysctl (non-POLICY subset), module blacklists for hardware you don't have, file permissions, umask, core dumps, package removal, banner | Low — reversible, effective immediately |
-| 2 | Web server + PHP hardening, security headers, TLS versions, NTP config, log forwarding, auditd rules, AIDE install, systemd unit sandboxing | Medium — can break an application; test each |
-| 3 | SSH hardening, firewall rules, PAM/faillock | **Lockout risk** — see below |
-| 4 | fstab mount options, kernel cmdline, GRUB password, `module.sig_enforce`, `lockdown`, `kernel.modules_disabled` | **Boot risk** — only takes effect on reboot, and a mistake means console recovery |
+| 1 | sysctl (non-POLICY subset), module blacklists for hardware you don't have, file permissions, umask, core dumps, package removal, banner | Low: reversible, effective immediately |
+| 2 | Web server + PHP hardening, security headers, TLS versions, NTP config, log forwarding, auditd rules, AIDE install, systemd unit sandboxing | Medium: can break an application; test each |
+| 3 | SSH hardening, firewall rules, PAM/faillock | **Lockout risk**; see below |
+| 4 | fstab mount options, kernel cmdline, GRUB password, `module.sig_enforce`, `lockdown`, `kernel.modules_disabled` | **Boot risk**, only takes effect on reboot, and a mistake means console recovery |
 
 ## Lockout-risk changes
 
@@ -30,7 +30,7 @@ Only after explicit approval. Auditing and changing are separate steps.
 the new config in the second session; if it fails, the first session is still there to revert.
 
 ```bash
-# validate before restarting — never restart on an unvalidated config
+# validate before restarting, never restart on an unvalidated config
 sshd -t                     # syntax
 sshd -T | grep -iE 'permitrootlogin|passwordauth|allowusers'   # effective result
 systemctl reload sshd       # reload keeps existing sessions alive; restart is fine too but reload is safer
@@ -56,7 +56,7 @@ console.
 
 - **fstab**: `mount -a` after editing catches syntax errors while the system is still up. A bad
   fstab drops the machine into emergency mode on reboot. Test `noexec` on `/tmp` and `/var` against
-  the actual workload first — package hooks, Java, Docker and CI runners commonly break.
+  the actual workload first: package hooks, Java, Docker and CI runners commonly break.
 - **GRUB password**: after `update-grub`, confirm the entry uses `--unrestricted` if unattended
   reboots must work without a password, or the host will hang at the menu.
 - **`module.sig_enforce=1`**: verify every needed module is signed first (`modinfo <mod> | grep
@@ -71,18 +71,18 @@ console.
 
 ### sysctl
 
-`/etc/sysctl.d/99-hardening.conf` — use the conservative baseline in `sysctl.md`, then:
+`/etc/sysctl.d/99-hardening.conf`; use the conservative baseline in `sysctl.md`, then:
 
 ```bash
 sysctl --system 2>&1 | grep -i 'cannot\|error'   # catches unsupported keys and out-of-range values
 ```
 
-An error here means the setting is *not* applied, even though the file exists — a silent
+An error here means the setting is *not* applied, even though the file exists: a silent
 false-positive in any audit that only reads config files.
 
 ### Module blacklist
 
-`/etc/modprobe.d/99-blacklist-hardening.conf` — lists in `boot-and-modules.md`. Then:
+`/etc/modprobe.d/99-blacklist-hardening.conf`: lists in `boot-and-modules.md`. Then:
 
 ```bash
 update-initramfs -u        # Debian/Ubuntu
@@ -103,7 +103,7 @@ systemctl daemon-reload
 
 ### SSH
 
-`/etc/ssh/sshd_config.d/99-hardening.conf` — settings in `services-ssh-logging.md`. On Debian and
+`/etc/ssh/sshd_config.d/99-hardening.conf`: settings in `services-ssh-logging.md`. On Debian and
 Ubuntu confirm the main file's `Include /etc/ssh/sshd_config.d/*.conf` line is present and comes
 first, then verify with `sshd -T`, not by reading the file.
 
@@ -140,7 +140,7 @@ apachectl -t && systemctl reload apache2
 ```
 
 `reload` does not drop live connections; `restart` does. Reload after every single change and check
-the site still serves before moving on — security headers and TLS-version changes are the ones that
+the site still serves before moving on: security headers and TLS-version changes are the ones that
 most often break a client.
 
 ### Remote logging (rsyslog over TLS)
@@ -157,11 +157,11 @@ action(type="omfwd" target="logs.example.net" port="6514" protocol="tcp"
 ```
 
 The disk-assisted queue matters: without it, log lines are dropped whenever the collector is
-unreachable — which is exactly when you need them.
+unreachable, which is exactly when you need them.
 
 ### Repository signature verification
 
-RPM — set the global default and fix every offending repo (per-repo wins):
+RPM; set the global default and fix every offending repo (per-repo wins):
 
 ```bash
 # global
@@ -169,7 +169,7 @@ grep -q '^gpgcheck' /etc/dnf/dnf.conf || echo 'gpgcheck=1' >> /etc/dnf/dnf.conf
 sed -i 's/^gpgcheck\s*=.*/gpgcheck=1/' /etc/dnf/dnf.conf
 echo 'localpkg_gpgcheck=1' >> /etc/dnf/dnf.conf
 
-# per repo — review each hit before changing; a repo that genuinely has no signing key
+# per repo; review each hit before changing; a repo that genuinely has no signing key
 # should be removed or replaced, not silently forced to gpgcheck=1
 grep -rn 'gpgcheck\s*=\s*0' /etc/yum.repos.d/
 sed -i.bak.$(date +%F) 's/^gpgcheck\s*=\s*0/gpgcheck=1/' /etc/yum.repos.d/<repo>.repo
@@ -178,7 +178,7 @@ sed -i.bak.$(date +%F) 's/^gpgcheck\s*=\s*0/gpgcheck=1/' /etc/yum.repos.d/<repo>
 dnf --setopt=gpgcheck=1 check-update
 ```
 
-APT — remove `trusted=yes`, pin third-party keys with `signed-by`, retire the legacy keyring:
+APT; remove `trusted=yes`, pin third-party keys with `signed-by`, retire the legacy keyring:
 
 ```bash
 # move a vendor key out of the global keyring into a scoped one
@@ -189,7 +189,7 @@ chmod 644 /etc/apt/keyrings/vendor.gpg
 apt-get update      # must complete with no NO_PUBKEY / "not signed" / EXPKEYSIG warnings
 ```
 
-If a repo genuinely cannot be verified, the fix is to stop using it — not to keep `trusted=yes`.
+If a repo genuinely cannot be verified, the fix is to stop using it, not to keep `trusted=yes`.
 
 ### USB device restriction
 
@@ -201,7 +201,7 @@ systemctl enable --now usbguard
 usbguard list-devices                                    # confirm expected devices show "allow"
 ```
 
-**Generate the policy while every device you need is plugged in**, and keep a console session open —
+**Generate the policy while every device you need is plugged in**, and keep a console session open:
 on a machine whose keyboard is USB, a policy generated without it can lock you out of the console.
 Add `IPCAllowedGroups=usbguard` so an admin can adjust policy without root.
 
@@ -242,8 +242,8 @@ semanage permissive -d myapp_t                            # remove the exemption
 restorecon -Rv /opt/myapp
 ```
 
-Put the single domain in permissive (`semanage permissive -a myapp_t`) while tuning — never the
-whole system — and remove the exemption afterwards. Verify with `ps -eZ | grep myapp`.
+Put the single domain in permissive (`semanage permissive -a myapp_t`) while tuning, never the
+whole system, and remove the exemption afterwards. Verify with `ps -eZ | grep myapp`.
 
 ### AIDE
 
@@ -266,5 +266,5 @@ the report:
 | nginx/apache include | remove the file, `nginx -t`/`apachectl -t`, reload |
 | fstab | restore the `.bak`, `mount -a` |
 | kernel cmdline | edit at the GRUB menu for one boot (`e`), then fix `/etc/default/grub` |
-| `kernel.modules_disabled` | reboot — there is no other way back |
+| `kernel.modules_disabled` | reboot: there is no other way back |
 | GRUB password | boot from rescue media, edit `/etc/grub.d/40_custom` |
