@@ -450,9 +450,21 @@ detect_platform() {
         VIRT=dmi-match; PLATFORM_WHY="DMI:${_dmi}" ;;
       *)
         if [ -r /proc/device-tree/model ]; then
-          # No DMI and no hypervisor bit: an ARM SBC (Raspberry Pi and friends), which is as
-          # physical as hardware gets and usually has the most exposed USB ports in the estate.
-          VIRT=none; PLATFORM_WHY="device-tree: $(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
+          # No DMI and no hypervisor bit usually means ARM, where a board is described by its
+          # device tree. An SBC (Raspberry Pi and friends) is as physical as hardware gets and
+          # tends to have the most exposed USB ports in the estate. But a guest has a device tree
+          # too: QEMU's virt machine calls itself "linux,dummy-virt" and Xen's is "xen,xenvm", so
+          # match those before concluding that a device tree means real hardware.
+          _dt="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
+          [ -d /proc/device-tree/hypervisor ] && _dt="$_dt $(tr -d '\0' < /proc/device-tree/hypervisor/compatible 2>/dev/null)"
+          case "$_dt" in
+            # Anchored on the identifiers hypervisors actually publish. A bare *xen* substring
+            # would also swallow a board called Xenon and report real hardware as a guest.
+            *dummy-virt*|*QEMU*|*qemu*|*XENVM*|*xen,xen*|*xen,dom*|*KVM*|*kvm*|*VMware*|*virtio,*)
+              VIRT=dt-match; PLATFORM_WHY="device-tree: $_dt" ;;
+            *)
+              VIRT=none; PLATFORM_WHY="device-tree: $_dt" ;;
+          esac
         elif [ -n "$_dmi" ]; then
           VIRT=none; PLATFORM_WHY="DMI:${_dmi}"
         fi ;;

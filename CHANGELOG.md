@@ -19,8 +19,11 @@ USB lockdown is now scored against the machine it is being audited on.
   on and the SMBIOS chassis type where DMI exposes one. `systemd-detect-virt` is authoritative
   when present; below it sit `/sys/hypervisor/type`, the CPUID hypervisor bit, DMI vendor and
   product strings, and `/proc/device-tree/model` so that an ARM board with none of the above is
-  still recognised as the very physical thing it is. When nothing answers, the verdict is
-  `unknown`, not a guess.
+  still recognised as the very physical thing it is. A device tree is not by itself proof of real
+  hardware, since QEMU's virt machine calls itself `linux,dummy-virt` and Xen guests announce
+  `xen,xenvm`, so those are matched first; the Xen patterns are anchored on the identifiers a
+  hypervisor actually publishes rather than a bare `xen` substring, which would have reported a
+  board named Xenon as a guest. When nothing answers, the verdict is `unknown`, not a guess.
 - **`tests/usb-platform.sh`**, wired into the live CI job. A CI runner is a guest, so the case
   that matters most could never be exercised there; the test stubs `systemd-detect-virt` ahead on
   `PATH` and drives the real collector down the bare-metal branch, asserting that a missing USB

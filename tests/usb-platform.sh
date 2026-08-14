@@ -74,6 +74,37 @@ for c in "12 block PASS" "12 reject PASS" "0 block FAIL" "0 reject FAIL" \
   else bad "rules=$1 target=$2 -> got $got, want $3"; fi
 done
 
+# On ARM there is usually no DMI and no CPUID hypervisor bit, so the device tree is the only
+# thing left to judge by. A device tree is not proof of real hardware: QEMU's virt machine calls
+# itself "linux,dummy-virt" and Xen's guests announce "xen,xenvm". Getting this backwards would
+# classify an ARM guest as bare metal and hand back a FAIL for a port it does not have. The
+# pattern is lifted out of the collector at run time rather than copied, so this cannot pass
+# while the collector says something else.
+printf '\n== ARM device-tree classification ==\n'
+DT_PATTERN="$(grep -o '\*dummy-virt\*[^)]*' "$COLLECT" | head -1)"
+if [ -z "$DT_PATTERN" ]; then
+  bad "could not extract the device-tree pattern from the collector"
+else
+  ok "pattern read from the collector: $DT_PATTERN"
+  dt() { eval "case \"\$1\" in ${DT_PATTERN}) printf virtual ;; *) printf physical ;; esac"; }
+  while IFS='|' read -r model want; do
+    [ -z "$model" ] && continue
+    got="$(dt "$model")"
+    if [ "$got" = "$want" ]; then ok "$model -> $got"
+    else bad "$model -> got $got, want $want"; fi
+  done <<'DTCASES'
+linux,dummy-virt|virtual
+QEMU KVM Virtual Machine|virtual
+XENVM-4.11 xen,xenvm|virtual
+Raspberry Pi 5 Model B Rev 1.0|physical
+Raspberry Pi 4 Model B Rev 1.4|physical
+Radxa ROCK 5B|physical
+NVIDIA Jetson Orin Nano Developer Kit|physical
+Xenon Development Board|physical
+Marvell Armada 8040 community board|physical
+DTCASES
+fi
+
 # ---------------------------------------------------------------- live behaviour
 # The blocks above check the rule in isolation, which is only a statement of intent: they would
 # still pass if the collector stopped using that rule. These run the real collector and read its
