@@ -20,7 +20,7 @@ Then ask Claude to audit a host, or point it at an image.
 
 ## What it looks at
 
-**459 distinct checks across 33 areas.** The number a given host emits is a subset — sections
+**460 distinct checks across 33 areas.** The number a given host emits is a subset — sections
 for subsystems it does not run collapse to a single `NA`, and a host with Docker, a web server,
 TLS listeners and eBPF programs loaded emits far more than a minimal one. Coverage includes:
 

@@ -54,6 +54,14 @@ reason not to.
    Measured on three production images, those alone were 49 of 55 non-`PASS` lines, which buried
    the three that were actionable.
 
+   The same reasoning applies to hardware. `system.platform` reports physical, virtual or unknown,
+   and the `USB` section is scored against it: a missing device policy is a `FAIL` on bare metal,
+   a `WARN` on a guest that has a USB bus, and `NA` where there is no bus to defend. Do not
+   reinstate a suppressed USB finding against a cloud instance because the control is missing;
+   check `usb.context` first. Where the platform is `unknown` the finding is reported at `WARN`
+   rather than dropped, and that one is worth resolving by hand, because an unrecognised machine
+   is often a physical one running a distribution without `systemd-detect-virt`.
+
    It further distinguishes **two kinds of container**, reported in `container.context`:
 
    - **workload** — PID 1 is the application. This is a deployed container, so its seccomp profile,

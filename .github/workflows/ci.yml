@@ -87,6 +87,10 @@ jobs:
           sudo bash "$S" --quick --passive > live.txt 2>live.err
           echo "exit=$?"
           tail -20 live.txt
+      # A runner is a guest with no USB bus, so the "physical" half of this can only be reached
+      # by stubbing the detection. The test does that itself; it needs a real non-container host.
+      - name: USB controls are scored against the platform
+        run: bash tests/usb-platform.sh
       - name: A run must produce checks and a summary
         run: |
           n=$(grep -c '^CHECK|' live.txt)

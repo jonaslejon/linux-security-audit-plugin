@@ -9,6 +9,42 @@ almost none of the audited subsystems and therefore emits close to the *minimum*
 maximum. The tool implements 450+ distinct checks across 33 areas; how many a given host emits
 depends on what it actually runs, with absent subsystems collapsing to a single `NA`.
 
+## [1.7.0] — 2026-08-14
+
+USB lockdown is now scored against the machine it is being audited on.
+
+### Added
+
+- **`system.platform`.** Reports physical, virtual or unknown, with the evidence it was decided
+  on and the SMBIOS chassis type where DMI exposes one. `systemd-detect-virt` is authoritative
+  when present; below it sit `/sys/hypervisor/type`, the CPUID hypervisor bit, DMI vendor and
+  product strings, and `/proc/device-tree/model` so that an ARM board with none of the above is
+  still recognised as the very physical thing it is. When nothing answers, the verdict is
+  `unknown`, not a guess.
+- **`tests/usb-platform.sh`**, wired into the live CI job. A CI runner is a guest, so the case
+  that matters most could never be exercised there; the test stubs `systemd-detect-virt` ahead on
+  `PATH` and drives the real collector down the bare-metal branch, asserting that a missing USB
+  policy is a `FAIL` there and not excused by the platform gate.
+
+### Fixed
+
+- **USB controls were reported against machines with no USB port.** The collector already
+  detected this and printed it (`usb_bus_present=0`), then ignored its own finding: on a Hyper-V
+  instance with no USB bus at all it still failed `usb.usbguard` for "not installed" and warned
+  that BadUSB keystroke injection was possible through the port that does not exist. A missing
+  control is now `FAIL` on bare metal, `WARN` on a guest that has a USB bus (whether it reaches a
+  physical port is set in the hypervisor and cannot be seen from inside), and `NA` where there is
+  no bus. `NA` remains not-a-pass, and `usb.restriction_present` still warns that a controller
+  attached later would be unrestricted.
+- **Where the platform cannot be determined, a missing control is `WARN`, never suppressed.**
+  Deciding a machine is a guest on no evidence is how a real exposure gets buried.
+- **usbguard with zero rules could report `PASS`.** `[ rules -gt 0 ] && [ target = block ] ||
+  [ target = reject ]` parses as `(A && B) || C`, so `ImplicitPolicyTarget=reject` satisfied the
+  condition on its own and a policy with no rules at all was advertised as correctly configured.
+  It is a deny-everything daemon that would lock out the console keyboard, and it is now a `FAIL`
+  with that explanation.
+- The offline (`--root`) skip for this section claimed the run was "inside a container".
+
 ## [1.6.0] — 2026-08-13
 
 Changes to the skill layer, driven by what auditing six real images actually required.

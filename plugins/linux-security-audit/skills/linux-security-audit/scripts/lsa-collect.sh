@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lsa-collect.sh — Linux Security Audit collector.  LINUX ONLY.
-LSA_VERSION="1.6.0"
+LSA_VERSION="1.7.0"
 #
 # SIDE EFFECTS — the complete list. This is designed to be run against production, so the
 # honest inventory matters more than a blanket warning:
@@ -195,6 +195,8 @@ ctr_host_owned() {
       CTR_WHY="a container writes to stdout/stderr and the runtime log driver ships it; journald retention and remote forwarding are configured on the host or in the logging sidecar" ;;
     misc.running_newest|kernel.*)
       CTR_WHY="the kernel is the host's; a container has no kernel of its own to update" ;;
+    system.platform)
+      CTR_WHY="whether the machine is physical or virtual is a property of the host, and an image can be deployed to either. It decides whether the USB and DMA controls apply, so determine it on the host" ;;
     proc.hidepid)
       CTR_WHY="/proc is mounted into the container by the runtime; hidepid is set with a --mount option or the pod spec, not from inside the image" ;;
     *) return 1 ;;
@@ -421,6 +423,58 @@ host_owned() { # true when a host-level check cannot describe this execution con
   [ -n "$CTR" ]
 }
 
+# ---- physical or virtual ------------------------------------------------------------------
+# Controls that defend a physical port (USB device policy, DMA protection) only mean something
+# where such a port exists. "usbguard not installed" against a cloud instance with no USB bus is
+# noise, and noise is what gets a report skimmed instead of read. Conversely a machine somebody
+# can walk up to needs those controls, so the platform decides the severity, not the tester.
+PLATFORM=unknown; VIRT=unknown; PLATFORM_WHY=""; CHASSIS=""
+detect_platform() {
+  if have systemd-detect-virt; then
+    # Authoritative, and the only source that reliably reports "none" for bare metal.
+    VIRT="$(systemd-detect-virt -v 2>/dev/null)"; [ -z "$VIRT" ] && VIRT=none
+    PLATFORM_WHY="systemd-detect-virt"
+  elif [ -r /sys/hypervisor/type ]; then
+    VIRT="$(cat /sys/hypervisor/type 2>/dev/null)"; PLATFORM_WHY="/sys/hypervisor/type"
+  elif grep -qE '^flags[[:space:]]*:.* hypervisor( |$)' /proc/cpuinfo 2>/dev/null; then
+    # CPUID hypervisor bit: set by every mainstream hypervisor, and not distro-dependent.
+    VIRT=hypervisor-bit; PLATFORM_WHY="hypervisor flag in /proc/cpuinfo"
+  else
+    _dmi=""
+    for _f in sys_vendor product_name board_vendor; do
+      [ -r "/sys/class/dmi/id/$_f" ] && _dmi="$_dmi $(cat "/sys/class/dmi/id/$_f" 2>/dev/null)"
+    done
+    case "$_dmi" in
+      *QEMU*|*KVM*|*VMware*|*VirtualBox*|*innotek*|*Xen*|*Bochs*|*Parallels*|*oVirt*|\
+      *OpenStack*|*"Virtual Machine"*|*"Virtual Platform"*|*"Google Compute Engine"*)
+        VIRT=dmi-match; PLATFORM_WHY="DMI:${_dmi}" ;;
+      *)
+        if [ -r /proc/device-tree/model ]; then
+          # No DMI and no hypervisor bit: an ARM SBC (Raspberry Pi and friends), which is as
+          # physical as hardware gets and usually has the most exposed USB ports in the estate.
+          VIRT=none; PLATFORM_WHY="device-tree: $(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
+        elif [ -n "$_dmi" ]; then
+          VIRT=none; PLATFORM_WHY="DMI:${_dmi}"
+        fi ;;
+    esac
+  fi
+  case "$VIRT" in
+    none)       PLATFORM=physical ;;
+    unknown|"") PLATFORM=unknown ;;
+    *)          PLATFORM=virtual ;;
+  esac
+  # SMBIOS chassis type. A machine that leaves the building is a different USB threat model
+  # from one bolted into a rack in a datacentre with badge access.
+  if [ -r /sys/class/dmi/id/chassis_type ]; then
+    case "$(cat /sys/class/dmi/id/chassis_type 2>/dev/null)" in
+      3|4|5|6|7|13|15|16)     CHASSIS=desktop ;;
+      8|9|10|11|14|30|31|32)  CHASSIS=portable ;;
+      17|22|23|28|29)         CHASSIS=server ;;
+    esac
+  fi
+}
+[ -z "$CTR" ] && [ "$OFFLINE" != "1" ] && detect_platform
+
 printf '===== LINUX SECURITY AUDIT COLLECTOR =====\n'
 printf 'collected_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
 printf 'hostname=%s\n' "$(hostname 2>/dev/null)"
@@ -489,6 +543,10 @@ uptime 2>/dev/null
 
 KREL="$(uname -r)"
 chk kernel.release INFO "$KREL" ""
+# Physical or virtual decides whether the port-level controls further down are findings or
+# noise, so it is stated once, up front, with the evidence it was decided on.
+chk system.platform INFO "$PLATFORM (virt=${VIRT}${CHASSIS:+, chassis=$CHASSIS})" \
+  "${PLATFORM_WHY:+determined from $PLATFORM_WHY. }a physical machine has ports somebody can plug into, so USB device policy and DMA protection apply to it; on a virtual instance those same controls are usually unenforceable and are reported as not applicable rather than as defects"
 # If a collection tool is missing, every check that needs it degrades. Say so once, loudly,
 # rather than letting each dependent check report a misleading absence.
 MISSING_TOOLS=""
@@ -3762,12 +3820,42 @@ ls -l "$(rf /etc/cron.allow)" "$(rf /etc/cron.deny)" "$(rf /etc/at.allow)" "$(rf
 # ------------------------------------------------------------------ 22. USB
 sec USB_PERIPHERALS
 if [ -n "$CTR" ] || [ "$OFFLINE" = "1" ]; then
-  chk usb_peripherals.container_context NA "running inside a $CTRTYPE container" "USB is a HOST concern; a container has no device enumeration of its own — audit the host for this section"
+  if [ -n "$CTR" ]; then
+    chk usb_peripherals.container_context NA "running inside a $CTRTYPE container" "USB is a host concern; a container has no device enumeration of its own, so audit the host for this section"
+  else
+    chk usb_peripherals.container_context NA "offline (--root): no device enumeration in a mounted image" "whether the machine is physical, and what is plugged into it, are properties of a running system. Audit the booted instance for this section"
+  fi
 else
-VIRT="$(systemd-detect-virt 2>/dev/null || echo unknown)"
 HAS_USB_HW=0
 [ -d /sys/bus/usb/devices ] && ls /sys/bus/usb/devices/ 2>/dev/null | grep -q . && HAS_USB_HW=1
-chk usb.context INFO "virt=$VIRT usb_bus_present=$HAS_USB_HW" "a VM with no passthrough has no physical USB port; a bare-metal host does"
+chk usb.context INFO "platform=$PLATFORM virt=$VIRT usb_bus_present=$HAS_USB_HW${CHASSIS:+ chassis=$CHASSIS}" \
+  "decides how the rest of this section is scored: a machine with real ports is held to them, a virtual instance with no USB bus is not"
+
+# How to score a missing USB control on THIS platform. A control that cannot be exercised is
+# not a defect, and a control that can be is not excused by being inconvenient.
+#   physical              -> FAIL. Somebody can walk up and plug something in.
+#   virtual, USB bus      -> WARN. A bus exists. Whether it reaches a physical port depends on
+#                            passthrough configured in the hypervisor, which is not visible
+#                            from inside the guest, so do not assert either way.
+#   virtual, no USB bus   -> NA.   Nothing to lock down. NA is not a pass: it says the question
+#                            was not applicable here, and the summary check still WARNs that a
+#                            controller attached later would be unrestricted.
+if [ "$PLATFORM" = "physical" ]; then
+  USB_MISS=FAIL
+  USB_WHY="this is bare metal${CHASSIS:+ ($CHASSIS)}, so a port exists that somebody can plug into"
+elif [ "$PLATFORM" = "unknown" ]; then
+  # No systemd-detect-virt, no DMI, no device tree, no hypervisor bit. Reported at WARN rather
+  # than FAIL because the premise is unproven, and never suppressed, because the machine may
+  # well be physical. Deciding it is a guest on no evidence is how a real exposure gets buried.
+  USB_MISS=WARN
+  USB_WHY="the platform could not be determined, so this is reported at reduced severity rather than suppressed. If this machine is physical, treat it as a finding; install systemd or dmidecode to let the next run decide"
+elif [ "$HAS_USB_HW" = "1" ]; then
+  USB_MISS=WARN
+  USB_WHY="a USB bus is present on a $VIRT guest; whether it reaches a physical port depends on passthrough configured in the hypervisor, which cannot be seen from inside the guest"
+else
+  USB_MISS=NA
+  USB_WHY="no USB bus on a $VIRT guest, so there is no port to restrict. Not a pass: see usb.restriction_present for what changes if a controller is attached later"
+fi
 
 # --- 1. USBGuard: the policy-based control (allow-list of specific devices) ---
 if have usbguard || [ -d "$(rf /etc/usbguard)" ]; then
@@ -3779,10 +3867,15 @@ if have usbguard || [ -d "$(rf /etc/usbguard)" ]; then
   RULES="$(wc -l < "$(rf /etc/usbguard/rules.conf)" 2>/dev/null | tr -d ' ')"
   IPT="$(grep -hE '^\s*ImplicitPolicyTarget' "$(rf /etc/usbguard/usbguard-daemon.conf)" 2>/dev/null | awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')"
   if [ "$UGACTIVE" = "1" ]; then
-    if [ "${RULES:-0}" -gt 0 ] && [ "$IPT" = "block" ] || [ "$IPT" = "reject" ]; then
+    # Precedence matters here. Written as `A && B || C` the shell reads it as `(A && B) || C`,
+    # so ImplicitPolicyTarget=reject used to satisfy the whole condition on its own and a policy
+    # with ZERO rules reported PASS. Both halves are now grouped explicitly.
+    if [ "${RULES:-0}" -gt 0 ] && { [ "$IPT" = "block" ] || [ "$IPT" = "reject" ]; }; then
       chk usb.usbguard PASS "active, ${RULES:-0} rule(s), ImplicitPolicyTarget=$IPT" "unknown devices are denied by default"
+    elif [ "$IPT" = "block" ] || [ "$IPT" = "reject" ]; then
+      chk usb.usbguard FAIL "active, ImplicitPolicyTarget=$IPT, but ${RULES:-0} rule(s)" "the default is to deny, and nothing is explicitly allowed, so every device including the console keyboard is blocked. That is either a lockout waiting to happen or a policy that was never generated: run 'usbguard generate-policy' against the devices this host is meant to accept"
     else
-      chk usb.usbguard FAIL "active but ImplicitPolicyTarget=${IPT:-allow} / ${RULES:-0} rule(s)" "USBGuard is running in allow-by-default mode — it logs devices but blocks nothing. Set ImplicitPolicyTarget=block and generate an allow-list with 'usbguard generate-policy'"
+      chk usb.usbguard FAIL "active but ImplicitPolicyTarget=${IPT:-allow} / ${RULES:-0} rule(s)" "USBGuard is running in allow-by-default mode: it logs devices but blocks nothing. Set ImplicitPolicyTarget=block and generate an allow-list with 'usbguard generate-policy'"
     fi
   else
     chk usb.usbguard FAIL "installed but not active" "the daemon must be enabled and running for the policy to apply"
@@ -3791,16 +3884,20 @@ if have usbguard || [ -d "$(rf /etc/usbguard)" ]; then
   raw "usbguard IPC access (who can change the policy)"
   grep -hE '^\s*IPCAllowed(Users|Groups)' "$(rf /etc/usbguard/usbguard-daemon.conf)" 2>/dev/null
 else
-  chk usb.usbguard FAIL "not installed" "no device-level USB policy. USBGuard is the control that restricts arbitrary USB devices by identity (vendor/product/serial/interface class), which blocks BadUSB-style HID injection, rogue network adapters and mass storage that a simple usb-storage blacklist does not"
+  chk usb.usbguard "$USB_MISS" "not installed" "no device-level USB policy. USBGuard restricts devices by identity (vendor/product/serial/interface class), which blocks BadUSB-style HID injection, rogue network adapters and mass storage that a simple usb-storage blacklist does not. $USB_WHY"
 fi
+
+# Defence in depth rather than the primary control, so it never exceeds WARN on a machine that
+# does have ports; but it is still NA where there is no bus to blacklist drivers for.
+USB_ADV=WARN; [ "$USB_MISS" = "NA" ] && USB_ADV=NA
 
 # --- 2. kernel-level blanket controls (coarser alternatives / defence in depth) ---
 if [ -e /proc/sys/kernel/deny_new_usb ]; then
   DNU="$(cat /proc/sys/kernel/deny_new_usb 2>/dev/null)"
   [ "$DNU" = "1" ] && chk usb.deny_new_usb PASS "1" "no new USB device is accepted after boot" \
-                   || chk usb.deny_new_usb FAIL "$DNU" "set to 1 (late in boot) to refuse all new USB devices"
+                   || chk usb.deny_new_usb "$USB_MISS" "$DNU" "set to 1 (late in boot) to refuse all new USB devices. $USB_WHY"
 else
-  chk usb.deny_new_usb NA "sysctl absent" "requires a linux-hardened kernel — use USBGuard or authorized_default instead"
+  chk usb.deny_new_usb NA "sysctl absent" "requires a linux-hardened kernel; use USBGuard or authorized_default instead"
 fi
 case " $(cat /proc/cmdline 2>/dev/null) " in *" nousb "*) chk usb.nousb PASS "nousb on cmdline" "USB support disabled entirely" ;; esac
 
@@ -3825,18 +3922,18 @@ for m in usb_storage uas usbnet cdc_ether rndis_host cdc_ncm usbhid hid_generic;
   if printf '%s' "$MPD" | grep -qE "^\s*install\s+$(printf '%s' "$m" | sed 's/_/[_-]/g')\s+/bin/(false|true)" \
      || printf '%s' "$MPD" | grep -qE "^\s*blacklist\s+$m\s*$"; then :; else USBMODS="$USBMODS $m"; fi
 done
-[ -n "$USBMODS" ] && chk usb.module_blacklist WARN "not blocked:$USBMODS" "usb_storage/uas enable mass-storage exfiltration; usbnet/cdc_ether/rndis let a USB device become a network interface and hijack routing/DNS; usbhid is the BadUSB keystroke-injection path (blocking it disables real keyboards — only for headless hosts)" \
+[ -n "$USBMODS" ] && chk usb.module_blacklist "$USB_ADV" "not blocked:$USBMODS" "usb_storage/uas enable mass-storage exfiltration; usbnet/cdc_ether/rndis let a USB device become a network interface and hijack routing/DNS; usbhid is the BadUSB keystroke-injection path (blocking it disables real keyboards, so headless hosts only). $USB_WHY" \
                 || chk usb.module_blacklist PASS "storage/network/HID USB modules blocked" ""
 raw "USB-related modules currently loaded"
 lsmod 2>/dev/null | grep -E '^(usb_storage|uas|usbnet|cdc_ether|rndis_host|usbhid|firewire|thunderbolt)'
 
-# --- 5. DMA-capable ports (Thunderbolt/FireWire) — direct memory read, no driver needed ---
+# --- 5. DMA-capable ports (Thunderbolt/FireWire): direct memory read, no driver needed ---
 if [ -d /sys/bus/thunderbolt/devices ]; then
   raw "thunderbolt devices and authorization"
   for d in /sys/bus/thunderbolt/devices/*/authorized; do [ -r "$d" ] && printf '%s = %s\n' "$d" "$(cat "$d")"; done
   IOMMU=0; ls /sys/class/iommu/ 2>/dev/null | grep -q . && IOMMU=1
   [ "$IOMMU" = "1" ] && chk usb.iommu PASS "IOMMU active" "DMA from Thunderbolt/PCIe is constrained" \
-                     || chk usb.iommu FAIL "no IOMMU groups present" "a Thunderbolt/FireWire device can read and write system memory directly, bypassing every software control — enable intel_iommu=on/amd_iommu=on"
+                     || chk usb.iommu FAIL "no IOMMU groups present" "a Thunderbolt/FireWire device can read and write system memory directly, bypassing every software control. Enable intel_iommu=on/amd_iommu=on"
 fi
 
 # --- overall verdict: is ANY effective USB restriction in place? ---
@@ -3848,10 +3945,12 @@ case " $(cat /proc/cmdline 2>/dev/null) " in *" nousb "*) USBCTRL="$USBCTRL nous
 [ -z "$USBMODS" ] && USBCTRL="$USBCTRL module-blacklist"
 if [ -n "$USBCTRL" ]; then
   chk usb.restriction_present PASS "$USBCTRL" ""
+elif [ "$PLATFORM" = "physical" ]; then
+  chk usb.restriction_present FAIL "none${CHASSIS:+ ($CHASSIS)}" "any USB device plugged into this machine is accepted and driven automatically: mass storage for exfiltration, a keyboard for BadUSB keystroke injection, or a network adapter that becomes the default route. Install USBGuard with ImplicitPolicyTarget=block, or set authorized_default=0 via udev"
 elif [ "$HAS_USB_HW" = "1" ]; then
-  chk usb.restriction_present FAIL "none" "any USB device plugged into this machine is accepted and driven automatically — mass storage for exfiltration, a keyboard for BadUSB keystroke injection, or a network adapter that becomes the default route. Install USBGuard with ImplicitPolicyTarget=block, or set authorized_default=0 via udev"
+  chk usb.restriction_present WARN "none (platform=$PLATFORM, virt=$VIRT, USB bus present)" "no USB restriction is configured, and a USB bus exists. On a guest that bus is usually an emulated root hub or tablet that nobody can reach by hand; confirm the hypervisor is not passing a physical controller through, and that this is not in fact a bare-metal machine, before treating it as low risk"
 else
-  chk usb.restriction_present WARN "none (virt=$VIRT, no USB bus detected)" "low practical risk on this platform, but a USB controller added later would be unrestricted"
+  chk usb.restriction_present WARN "none (platform=$PLATFORM, virt=$VIRT, no USB bus detected)" "low practical risk on this platform, but a USB controller added later would be unrestricted"
 fi
 
 # --------------------------------------------------- 23. PRIVILEGE-ESCALATION PATHS

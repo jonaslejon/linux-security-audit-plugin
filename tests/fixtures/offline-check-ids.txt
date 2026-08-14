@@ -178,6 +178,7 @@ sysctl.vm.swappiness
 sysctl.vm.unprivileged_userfaultfd
 system.base_os
 system.base_os_eol
+system.platform
 time.authenticated
 time.server_exposed
 time.sources
