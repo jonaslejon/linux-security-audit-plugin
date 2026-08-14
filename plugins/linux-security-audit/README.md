@@ -36,6 +36,7 @@ TLS listeners and eBPF programs loaded emits far more than a minimal one. Covera
 - **Secrets**: cleartext credentials and private keys on disk, **reported with values redacted**
 - **Containers and Docker**: daemon hardening (`userns-remap`, `icc`, default `no-new-privileges`), running-container posture (privileged, mounted `docker.sock`, missing memory/PID limits, writable rootfs), and credentials baked into image layers
 - **Images and templates**: SSH host keys or entropy seeds baked into a golden image
+- **Physical and peripheral**: USB device policy (USBGuard, `authorized_default`, `deny_new_usb`), Thunderbolt/DMA exposure and IOMMU. Scored against whether the machine is bare metal, so a cloud instance with no USB bus is not failed for a port it does not have. An allow-list is what passes here; a driver blacklist is depth, not the control
 - **Drift**: where persisted config and running kernel disagree, and in which direction
 
 ## Three collection modes
